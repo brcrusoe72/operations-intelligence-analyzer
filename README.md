@@ -1,0 +1,89 @@
+# Traksys OEE Analyzer
+
+Production-grade OEE analysis suite for food manufacturing. Reads Traksys/MES data exports and generates multi-sheet Excel reports with shift deep dives, downtime Pareto analysis, fault classification, and prioritized action recommendations.
+
+Built by a CI engineer who got tired of the Pareto analysis never getting done.
+
+## What It Does
+
+Drop in your Traksys OEE export. Get back a formatted, color-coded Excel workbook with:
+
+- **Executive Summary** — KPIs, date range, cases produced, top/bottom shifts
+- **Shift Deep Dives** — Hour-by-hour patterns, worst hours, consistency scores, day-of-week breakdowns
+- **Loss Breakdown** — Availability vs Performance vs Quality by shift
+- **Downtime Pareto** — Top causes ranked by total minutes with fault classification
+- **Fault Classification** — Equipment, Micro Stops, Process/Changeover, Scheduled, Data Gaps
+- **Worst Hours** — The 25 worst OEE hours with root cause analysis
+- **What to Focus On** — Prioritized action items with 5-step investigation plans
+
+## Three Tools
+
+| Script | Purpose | Output |
+|--------|---------|--------|
+| `analyze.py` | Plant-wide OEE + downtime analysis across all shifts | 12-15 sheet Excel |
+| `third_shift_report.py` | Deep dive on a specific shift with product-level granularity | 13 sheet Excel |
+| `third_shift_targets.py` | Weekly target tracker + email summary generator | 2 sheet Excel + email .txt |
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+
+# Basic OEE analysis
+python analyze.py your_oee_export.xlsx
+
+# Full analysis with downtime reason codes
+python analyze.py your_oee_export.xlsx --downtime knowledge_base.json
+
+# 3rd shift deep dive with product data
+python third_shift_report.py oee_export.xlsx --downtime kb.json --product product_data.json
+
+# Target tracker with email output
+python third_shift_targets.py --product product_data.json --downtime kb.json
+```
+
+## Streamlit App
+
+Run the web interface — no CLI needed:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Upload your Excel file, optionally add downtime JSON, click Analyze, download the result.
+
+## Input Data Format
+
+### OEE Export (Excel)
+Your Traksys export needs these sheets:
+- **DayShiftHour** — Hourly data with columns: Shift Date, Shift, Shift Hour, Time Block, Block Start, Block End, Cases/Hr, OEE (%), Total Cases, Total Hours, Availability, Performance, Quality, Intervals
+
+### Downtime Knowledge Base (JSON, optional)
+```json
+{
+  "downtime_reason_codes": [
+    {"reason": "Caser - Riverwood", "total_minutes": 8489, "total_occurrences": 2282}
+  ],
+  "pareto_top_10": {
+    "rankings": [...]
+  }
+}
+```
+
+## Who This Is For
+
+- **CI Engineers** who never have time to build the Pareto
+- **Plant Managers** who want numbers from the machine, not opinions
+- **Supervisors** who need shift-level accountability data
+- **Anyone** running Traksys, Vorne, or similar MES systems with OEE exports
+
+## The Philosophy
+
+- Numbers from the machine, not opinions
+- No paragraphs — numbers first, short action items
+- Red/yellow/green so you can scan in 10 seconds
+- Every sheet answers "so what?" with specific next steps
+
+## License
+
+MIT

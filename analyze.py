@@ -67,39 +67,162 @@ def excel_date_to_datetime(serial):
 
 
 # ---------------------------------------------------------------------------
+# Sheet-name matching helpers
+# ---------------------------------------------------------------------------
+EXPECTED_SHEETS = {
+    "DayShiftHour": {
+        "aliases": ["dayshifthour", "day_shift_hour", "day shift hour",
+                     "hourly", "hourlydata", "hourly_data", "hourly data"],
+        "columns": [
+            "shift_date", "shift", "shift_hour", "time_block",
+            "block_start", "block_end", "cases_per_hour", "oee_pct",
+            "total_cases", "total_hours", "availability", "performance",
+            "quality", "intervals"
+        ],
+    },
+    "DayShift_Summary": {
+        "aliases": ["dayshift_summary", "dayshiftsummary", "day_shift_summary",
+                     "day shift summary", "daily_summary", "dailysummary",
+                     "daily summary"],
+        "columns": [
+            "shift_date", "shift", "cases_per_hour", "oee_pct",
+            "total_cases", "total_hours", "hour_blocks"
+        ],
+    },
+    "Shift_Summary": {
+        "aliases": ["shift_summary", "shiftsummary", "shift summary",
+                     "overall_summary", "overallsummary", "overall summary",
+                     "summary"],
+        "columns": [
+            "shift", "cases_per_hour", "oee_pct",
+            "total_cases", "total_hours", "n_intervals"
+        ],
+    },
+    "ShiftHour_Summary": {
+        "aliases": ["shifthour_summary", "shifthoursummary",
+                     "shift_hour_summary", "shift hour summary",
+                     "hour_summary", "hoursummary", "hour summary",
+                     "houravg", "hour_avg", "hour avg"],
+        "columns": [
+            "shift", "shift_hour", "time_block", "cases_per_hour", "oee_pct"
+        ],
+    },
+}
+
+
+def _normalize(name):
+    """Lower-case, strip whitespace and underscores for fuzzy comparison."""
+    return name.lower().strip().replace("_", "").replace(" ", "")
+
+
+def _match_sheet(expected_name, available_sheets, already_matched):
+    """Return the actual sheet name that best matches *expected_name*.
+
+    Match strategy (first hit wins):
+      1. Exact match (case-insensitive)
+      2. Normalized match (ignore spaces/underscores/case)
+      3. Alias list match
+      4. Column-count heuristic (match by number of columns)
+    """
+    info = EXPECTED_SHEETS[expected_name]
+    norm_expected = _normalize(expected_name)
+    remaining = [s for s in available_sheets if s not in already_matched]
+
+    # 1. exact (case-insensitive)
+    for s in remaining:
+        if s.lower().strip() == expected_name.lower():
+            return s
+
+    # 2. normalized
+    for s in remaining:
+        if _normalize(s) == norm_expected:
+            return s
+
+    # 3. alias list
+    for s in remaining:
+        if _normalize(s) in info["aliases"]:
+            return s
+
+    # 4. column-count heuristic — only if a single remaining sheet has the
+    #    right number of columns (avoids ambiguity)
+    expected_ncols = len(info["columns"])
+    col_matches = []
+    for s in remaining:
+        try:
+            df = pd.read_excel(
+                available_sheets["__filepath__"], sheet_name=s, nrows=0
+            )
+            if len(df.columns) == expected_ncols:
+                col_matches.append(s)
+        except Exception:
+            pass
+    if len(col_matches) == 1:
+        return col_matches[0]
+
+    return None
+
+
+def _resolve_sheets(filepath):
+    """Return a dict mapping canonical sheet names → actual sheet names.
+
+    Raises ValueError with a helpful message when sheets can't be matched.
+    """
+    xls = pd.ExcelFile(filepath)
+    available = xls.sheet_names
+    xls.close()
+
+    # stash filepath so the column-count heuristic can read sheets
+    avail_map = {"__filepath__": filepath}
+    for s in available:
+        avail_map[s] = s
+
+    matched = {}
+    unmatched = []
+    for canonical in EXPECTED_SHEETS:
+        actual = _match_sheet(canonical, avail_map, set(matched.values()))
+        if actual:
+            matched[canonical] = actual
+        else:
+            unmatched.append(canonical)
+
+    if unmatched:
+        sheet_list = ", ".join(f"'{s}'" for s in available)
+        missing_list = ", ".join(f"'{s}'" for s in unmatched)
+        raise ValueError(
+            f"Could not find matching worksheet(s) for: {missing_list}.\n"
+            f"Your file contains these sheets: [{sheet_list}].\n"
+            f"Expected sheets: DayShiftHour (14 cols), DayShift_Summary (7 cols), "
+            f"Shift_Summary (6 cols), ShiftHour_Summary (5 cols).\n"
+            f"Rename your sheets to match or check that you uploaded the right file."
+        )
+
+    return matched
+
+
+# ---------------------------------------------------------------------------
 # Load OEE Data
 # ---------------------------------------------------------------------------
 def load_oee_data(filepath):
     print(f"Reading OEE data: {filepath}")
-    hourly = pd.read_excel(filepath, sheet_name="DayShiftHour")
-    hourly.columns = [
-        "shift_date", "shift", "shift_hour", "time_block",
-        "block_start", "block_end", "cases_per_hour", "oee_pct",
-        "total_cases", "total_hours", "availability", "performance",
-        "quality", "intervals"
-    ]
+    sheet_map = _resolve_sheets(filepath)
+    print(f"  Matched sheets: {sheet_map}")
+
+    hourly = pd.read_excel(filepath, sheet_name=sheet_map["DayShiftHour"])
+    hourly.columns = EXPECTED_SHEETS["DayShiftHour"]["columns"]
     hourly["date"] = hourly["shift_date"].apply(excel_date_to_datetime)
     hourly["date_str"] = hourly["date"].dt.strftime("%Y-%m-%d")
     hourly["day_of_week"] = hourly["date"].dt.day_name()
 
-    shift_summary = pd.read_excel(filepath, sheet_name="DayShift_Summary")
-    shift_summary.columns = [
-        "shift_date", "shift", "cases_per_hour", "oee_pct",
-        "total_cases", "total_hours", "hour_blocks"
-    ]
+    shift_summary = pd.read_excel(filepath, sheet_name=sheet_map["DayShift_Summary"])
+    shift_summary.columns = EXPECTED_SHEETS["DayShift_Summary"]["columns"]
     shift_summary["date"] = shift_summary["shift_date"].apply(excel_date_to_datetime)
     shift_summary["date_str"] = shift_summary["date"].dt.strftime("%Y-%m-%d")
 
-    overall = pd.read_excel(filepath, sheet_name="Shift_Summary")
-    overall.columns = [
-        "shift", "cases_per_hour", "oee_pct",
-        "total_cases", "total_hours", "n_intervals"
-    ]
+    overall = pd.read_excel(filepath, sheet_name=sheet_map["Shift_Summary"])
+    overall.columns = EXPECTED_SHEETS["Shift_Summary"]["columns"]
 
-    hour_avg = pd.read_excel(filepath, sheet_name="ShiftHour_Summary")
-    hour_avg.columns = [
-        "shift", "shift_hour", "time_block", "cases_per_hour", "oee_pct"
-    ]
+    hour_avg = pd.read_excel(filepath, sheet_name=sheet_map["ShiftHour_Summary"])
+    hour_avg.columns = EXPECTED_SHEETS["ShiftHour_Summary"]["columns"]
 
     print(f"  {len(hourly)} hourly records, {hourly['date_str'].nunique()} days")
     return hourly, shift_summary, overall, hour_avg

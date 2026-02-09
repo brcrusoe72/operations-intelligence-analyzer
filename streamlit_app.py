@@ -3,6 +3,10 @@ Traksys OEE Analyzer — Web Interface
 =====================================
 Upload your Traksys OEE export, get back a formatted analysis workbook.
 
+Supports both:
+  - Raw Traksys exports (OEE Period Detail + Event Summary)
+  - Pre-processed OEE workbooks (DayShiftHour format)
+
 Usage:
   streamlit run streamlit_app.py
 """
@@ -13,6 +17,7 @@ import os
 from datetime import datetime
 
 from analyze import load_oee_data, load_downtime_data, analyze, write_excel
+from parse_traksys import parse_oee_period_detail, parse_event_summary, detect_file_type
 
 st.set_page_config(
     page_title="Traksys OEE Analyzer",
@@ -28,16 +33,16 @@ col1, col2 = st.columns(2)
 
 with col1:
     oee_file = st.file_uploader(
-        "OEE Export (Excel)",
+        "OEE Data (Excel)",
         type=["xlsx", "xls"],
-        help="Traksys OEE export with DayShiftHour, DayShift_Summary, Shift_Summary, ShiftHour_Summary sheets",
+        help="Traksys 'OEE Period Detail' export OR processed workbook with DayShiftHour sheets",
     )
 
 with col2:
     downtime_file = st.file_uploader(
-        "Downtime Knowledge Base (JSON) — optional",
-        type=["json"],
-        help="JSON with downtime_reason_codes, pareto_top_10, etc.",
+        "Downtime / Event Data — optional",
+        type=["json", "xlsx", "xls"],
+        help="Traksys 'Event Summary (Date)' export (.xlsx) or downtime knowledge base (.json)",
     )
 
 # --- Analyze ---
@@ -50,19 +55,36 @@ if oee_file is not None:
             with open(oee_path, "wb") as f:
                 f.write(oee_file.getbuffer())
 
-            downtime = None
-            if downtime_file is not None:
-                dt_path = os.path.join(tmp_dir, downtime_file.name)
-                with open(dt_path, "wb") as f:
-                    f.write(downtime_file.getbuffer())
-                try:
-                    downtime = load_downtime_data(dt_path)
-                except Exception as e:
-                    st.warning(f"Could not load downtime data: {e}")
+            # Detect OEE file format and load accordingly
+            file_type = detect_file_type(oee_path)
 
-            # Run analysis
             try:
-                hourly, shift_summary, overall, hour_avg = load_oee_data(oee_path)
+                if file_type == "oee_period_detail":
+                    st.info("Detected: Traksys OEE Period Detail export")
+                    hourly, shift_summary, overall, hour_avg = parse_oee_period_detail(oee_path)
+                else:
+                    hourly, shift_summary, overall, hour_avg = load_oee_data(oee_path)
+
+                # Load downtime / event data
+                downtime = None
+                if downtime_file is not None:
+                    dt_path = os.path.join(tmp_dir, downtime_file.name)
+                    with open(dt_path, "wb") as f:
+                        f.write(downtime_file.getbuffer())
+                    try:
+                        if downtime_file.name.lower().endswith(".json"):
+                            downtime = load_downtime_data(dt_path)
+                        else:
+                            dt_type = detect_file_type(dt_path)
+                            if dt_type == "event_summary":
+                                st.info("Detected: Traksys Event Summary export")
+                                downtime = parse_event_summary(dt_path)
+                            else:
+                                st.warning("Unrecognized downtime file format")
+                    except Exception as e:
+                        st.warning(f"Could not load downtime data: {e}")
+
+                # Run analysis
                 results = analyze(hourly, shift_summary, overall, hour_avg, downtime)
 
                 # Write output

@@ -20,6 +20,14 @@ import numpy as np
 # Config
 # ---------------------------------------------------------------------------
 EXCEL_EPOCH = datetime(1899, 12, 30)
+
+
+def _weighted_mean(values, weights):
+    """Production-weighted average, excluding zero-weight entries."""
+    mask = weights > 0
+    if not mask.any():
+        return 0.0
+    return float((values[mask] * weights[mask]).sum() / weights[mask].sum())
 EXCLUDE_REASONS = {"Not Scheduled", "Break-Lunch", "Lunch (Comida)", "Meetings"}
 
 # Fault classification keywords — used to bucket reason codes
@@ -574,7 +582,9 @@ def build_shift_deep_dive(shift_name, hourly, shift_summary, hour_avg, overall, 
     if len(ha_sorted) > 1:
         min_hour = ha_sorted["shift_hour"].min()
         first_hr_oee = ha_sorted[ha_sorted["shift_hour"] == min_hour]["oee_pct"].values
-        rest_oee = ha_sorted[ha_sorted["shift_hour"] != min_hour]["oee_pct"].mean()
+        rest = ha_sorted[ha_sorted["shift_hour"] != min_hour]
+        rest_oee = (_weighted_mean(rest["oee_pct"], rest["total_hours"])
+                    if "total_hours" in rest.columns else rest["oee_pct"].mean())
         if len(first_hr_oee) > 0:
             gap = rest_oee - first_hr_oee[0]
             if gap > 2:
@@ -615,8 +625,10 @@ def build_shift_deep_dive(shift_name, hourly, shift_summary, hour_avg, overall, 
 
     # Trend direction
     if len(ss_sorted) >= 7:
-        first_half = ss_sorted.head(len(ss_sorted) // 2)["oee_pct"].mean()
-        second_half = ss_sorted.tail(len(ss_sorted) // 2)["oee_pct"].mean()
+        fh = ss_sorted.head(len(ss_sorted) // 2)
+        sh2 = ss_sorted.tail(len(ss_sorted) // 2)
+        first_half = _weighted_mean(fh["oee_pct"], fh["total_hours"]) if "total_hours" in fh.columns else fh["oee_pct"].mean()
+        second_half = _weighted_mean(sh2["oee_pct"], sh2["total_hours"]) if "total_hours" in sh2.columns else sh2["oee_pct"].mean()
         direction = "improving" if second_half > first_half + 1 else "declining" if second_half < first_half - 1 else "flat"
         rows.append({"Section": "", "Metric": "Trend",
                      "Value": direction.upper(),
@@ -961,14 +973,17 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     # ===================================================================
     # TAB 10: DAILY TREND
     # ===================================================================
+    shift_summary["_w_oee"] = shift_summary["oee_pct"] * shift_summary["total_hours"]
     daily = (
         shift_summary.groupby("date_str")
         .agg(total_cases=("total_cases", "sum"), total_hours=("total_hours", "sum"),
-             avg_oee=("oee_pct", "mean"), n_shifts=("shift", "count"))
+             _w_oee=("_w_oee", "sum"), n_shifts=("shift", "count"))
         .reset_index()
     )
+    daily["avg_oee"] = (daily["_w_oee"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(1)
+    daily.drop(columns=["_w_oee"], inplace=True)
+    shift_summary.drop(columns=["_w_oee"], inplace=True, errors="ignore")
     daily["cases_per_hour"] = (daily["total_cases"] / daily["total_hours"]).round(0)
-    daily["avg_oee"] = daily["avg_oee"].round(1)
     daily["total_cases"] = daily["total_cases"].round(0)
     daily = daily.sort_values("date_str")
     daily["oee_7day_avg"] = daily["avg_oee"].rolling(7, min_periods=1).mean().round(1)
@@ -1145,8 +1160,10 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
         first_hour = pd.DataFrame()
         other_hours = pd.DataFrame()
     if len(first_hour) > 0 and len(other_hours) > 0:
-        first_avg_oee = first_hour["oee_pct"].mean()
-        other_avg_oee = other_hours["oee_pct"].mean()
+        first_avg_oee = (_weighted_mean(first_hour["oee_pct"], first_hour["total_hours"])
+                         if "total_hours" in first_hour.columns else first_hour["oee_pct"].mean())
+        other_avg_oee = (_weighted_mean(other_hours["oee_pct"], other_hours["total_hours"])
+                         if "total_hours" in other_hours.columns else other_hours["oee_pct"].mean())
         if first_avg_oee < other_avg_oee - 3:
             oee_gap = other_avg_oee - first_avg_oee
             recs.append({

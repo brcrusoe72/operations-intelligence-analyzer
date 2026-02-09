@@ -153,10 +153,12 @@ _HEADER_TO_INTERNAL = {
     "badcases": "bad_cases",
     "totalcases": "total_cases",
     "casesperhour": "cases_per_hour",
+    "cases/hr": "cases_per_hour",
     "cph": "cases_per_hour",
     # OEE metrics
     "oee": "oee_pct",
     "oeepct": "oee_pct",
+    "oee(%)": "oee_pct",
     "avgoee": "oee_pct",
     "availability": "availability",
     "avgavailability": "availability",

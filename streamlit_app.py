@@ -133,6 +133,26 @@ if oee_file is not None:
                 st.markdown("---")
                 st.caption(f"Sheets in output: {', '.join(results.keys())}")
 
+            except ValueError as e:
+                err_msg = str(e)
+                if "worksheet" in err_msg.lower() or "sheet" in err_msg.lower():
+                    st.error("**Sheet mismatch** — your Excel file doesn't have the expected sheet names.")
+                    st.info(
+                        "The analyzer expects these sheets in your Traksys OEE export:\n\n"
+                        "| Sheet | Columns |\n"
+                        "|---|---|\n"
+                        "| **DayShiftHour** | 14 columns — hourly OEE data |\n"
+                        "| **DayShift_Summary** | 7 columns — daily shift summary |\n"
+                        "| **Shift_Summary** | 6 columns — overall shift totals |\n"
+                        "| **ShiftHour_Summary** | 5 columns — average by shift & hour |\n\n"
+                        "**Fix options:**\n"
+                        "1. Rename your sheets to match the names above\n"
+                        "2. Check that you're uploading the correct Traksys OEE export file"
+                    )
+                    st.code(err_msg, language=None)
+                else:
+                    st.error(f"Analysis failed: {e}")
+                    st.exception(e)
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
                 st.exception(e)

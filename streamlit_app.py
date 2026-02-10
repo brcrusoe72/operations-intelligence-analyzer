@@ -174,6 +174,21 @@ with tab_analyze:
                             hide_index=True,
                         )
 
+                    # Dead Hours summary
+                    dead_df = results.get("Dead Hours")
+                    if dead_df is not None and len(dead_df) > 0:
+                        st.subheader("Dead Hours")
+                        # Show summary line
+                        summary_row = dead_df[dead_df["Date"].astype(str) == "SUMMARY"]
+                        if len(summary_row) > 0:
+                            st.markdown(f"**{summary_row.iloc[0]['Shift']}**")
+                        # Show top cause from machine data if available
+                        if "Cause (Machine Data)" in dead_df.columns:
+                            causes = dead_df[dead_df["Cause (Machine Data)"].astype(str).str.strip() != ""]
+                            if len(causes) > 0:
+                                top_cause = causes.iloc[0]["Cause (Machine Data)"]
+                                st.markdown(f"Top cause: {top_cause}")
+
                     # Top actions
                     focus_df = results.get("What to Focus On")
                     if focus_df is not None:

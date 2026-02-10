@@ -203,6 +203,7 @@ def parse_oee_period_detail(filepath):
             "hour_bucket": bucket,
             "shift_date": sd,
             "shift": shift,
+            "product": str(product).strip() if product else "",
             "good_cases": good_cases,
             "dur_hours": dur_hours,
             "availability": avail,
@@ -320,6 +321,13 @@ def _aggregate_hour(group):
     else:
         w_avail = w_perf = w_qual = w_oee = cph = 0.0
 
+    # Most common product in this hour (by duration)
+    product_code = ""
+    if "product" in group.columns:
+        prods = group[group["product"].astype(str).str.strip() != ""]
+        if len(prods) > 0:
+            product_code = prods.groupby("product")["dur_hours"].sum().idxmax()
+
     return pd.Series({
         "total_cases": total_cases,
         "total_hours": total_dur,
@@ -328,6 +336,7 @@ def _aggregate_hour(group):
         "performance": w_perf,
         "quality": w_qual,
         "oee_pct": w_oee * 100,  # decimal → percentage
+        "product_code": product_code,
     })
 
 
@@ -344,17 +353,25 @@ def parse_event_summary(filepath):
                followed by individual events (Col D has start time).
 
     Returns: downtime dict matching the format expected by analyze.analyze().
+    Includes:
+      - reasons_df: aggregate totals per reason code
+      - events_df: individual timestamped events with reason, shift, duration
+      - shift_reasons_df: events grouped by (shift, reason) for shift-level Pareto
     """
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb.active
 
     reasons = []
+    events = []
     current_reason = None
 
     for r in range(6, ws.max_row + 1):
         col_b = ws.cell(r, 2).value   # Line name (row 6 only)
         col_c = ws.cell(r, 3).value   # Reason code group
         col_d = ws.cell(r, 4).value   # Start time (individual events)
+        col_e = ws.cell(r, 5).value   # End time
+        col_f = ws.cell(r, 6).value   # Shift
+        col_g = ws.cell(r, 7).value   # OEE type (Availability Loss, etc.)
         col_j = ws.cell(r, 10).value  # Count
         col_n = ws.cell(r, 14).value  # Total duration
 
@@ -367,6 +384,7 @@ def parse_event_summary(filepath):
             name = str(col_c).strip()
             if not name:
                 continue
+            current_reason = name
             dur = _parse_duration_minutes(col_n)
             cnt = int(_safe_float(col_j)) if col_j else 0
             if cnt > 0 or dur > 0:
@@ -376,6 +394,26 @@ def parse_event_summary(filepath):
                     "total_occurrences": cnt,
                     "total_hours": round(dur / 60, 1),
                 })
+            continue
+
+        # Individual event row: Col D has a start time
+        if col_d and current_reason:
+            start = _parse_timestamp(col_d)
+            end = _parse_timestamp(col_e)
+            if start is None:
+                continue
+            shift = _get_shift(col_f)
+            oee_type = str(col_g).strip() if col_g else ""
+            dur = _parse_duration_minutes(col_n)
+
+            events.append({
+                "reason": current_reason,
+                "start_time": start,
+                "end_time": end,
+                "shift": shift or "",
+                "oee_type": oee_type,
+                "duration_minutes": round(dur, 1),
+            })
 
     wb.close()
 
@@ -384,8 +422,30 @@ def parse_event_summary(filepath):
         else pd.DataFrame(columns=["reason", "total_minutes", "total_occurrences", "total_hours"])
     )
 
+    events_df = (
+        pd.DataFrame(events) if events
+        else pd.DataFrame(columns=["reason", "start_time", "end_time", "shift",
+                                    "oee_type", "duration_minutes"])
+    )
+
+    # Build shift-level reason aggregates for per-shift Pareto
+    shift_reasons_df = pd.DataFrame()
+    if len(events_df) > 0 and events_df["shift"].str.strip().ne("").any():
+        shift_reasons_df = (
+            events_df[events_df["shift"].str.strip() != ""]
+            .groupby(["shift", "reason"])
+            .agg(
+                total_minutes=("duration_minutes", "sum"),
+                count=("duration_minutes", "count"),
+            )
+            .reset_index()
+            .sort_values(["shift", "total_minutes"], ascending=[True, False])
+        )
+
     return {
         "reasons_df": reasons_df,
+        "events_df": events_df,
+        "shift_reasons_df": shift_reasons_df,
         "pareto_df": pd.DataFrame(),
         "findings": [],
         "shift_samples": [],

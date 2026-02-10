@@ -19,6 +19,8 @@ import numpy as np
 
 from analyze import (
     _smart_rename, _coerce_numerics, _derive_columns, _aggregate_oee,
+    _compute_utilization, _build_dead_hour_narrative,
+    _correlate_dead_hours_with_events,
     _resolve_sheets, EXPECTED_SHEETS, excel_date_to_datetime,
 )
 from shared import (
@@ -81,19 +83,25 @@ def load_data(oee_path, dt_path=None, product_path=None):
 
     downtime = None
     if dt_path and os.path.exists(dt_path):
-        with open(dt_path, "r", encoding="utf-8") as f:
-            kb = json.load(f)
-        reasons_df = pd.DataFrame(kb.get("downtime_reason_codes", []))
-        if len(reasons_df) > 0:
-            for col in ["total_minutes", "total_occurrences", "total_hours"]:
-                reasons_df[col] = pd.to_numeric(reasons_df[col], errors="coerce").fillna(0)
-        downtime = {
-            "reasons_df": reasons_df,
-            "findings": kb.get("key_findings", []),
-            "shift_samples": kb.get("sample_data", {}).get("shift_report_sample_sheet_1_05_26", []),
-            "meta": kb.get("metadata", {}),
-            "oee_summary": kb.get("metadata", {}).get("oee_period_summary", {}),
-        }
+        if dt_path.lower().endswith(".json"):
+            with open(dt_path, "r", encoding="utf-8") as f:
+                kb = json.load(f)
+            reasons_df = pd.DataFrame(kb.get("downtime_reason_codes", []))
+            if len(reasons_df) > 0:
+                for col in ["total_minutes", "total_occurrences", "total_hours"]:
+                    reasons_df[col] = pd.to_numeric(reasons_df[col], errors="coerce").fillna(0)
+            downtime = {
+                "reasons_df": reasons_df,
+                "findings": kb.get("key_findings", []),
+                "shift_samples": kb.get("sample_data", {}).get("shift_report_sample_sheet_1_05_26", []),
+                "meta": kb.get("metadata", {}),
+                "oee_summary": kb.get("metadata", {}).get("oee_period_summary", {}),
+            }
+        else:
+            from parse_traksys import detect_file_type, parse_event_summary
+            dt_type = detect_file_type(dt_path)
+            if dt_type == "event_summary":
+                downtime = parse_event_summary(dt_path)
 
     product_data = None
     if product_path and os.path.exists(product_path):
@@ -169,7 +177,13 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
     target_cph = good_hours["cases_per_hour"].quantile(0.90)
     h3["cases_gap"] = (target_cph - h3["cases_per_hour"]).clip(lower=0) * h3["total_hours"]
 
+    # Utilization metrics
+    s3_util, s3_prod_hrs, s3_sched_hrs, s3_dead = _compute_utilization(h3)
+    s2_util, s2_prod_hrs, s2_sched_hrs, s2_dead = _compute_utilization(h2)
+    plant_util, plant_prod_hrs, plant_sched_hrs, plant_dead = _compute_utilization(hourly)
+
     has_downtime = downtime is not None and len(downtime.get("reasons_df", [])) > 0
+    has_events = has_downtime and len(downtime.get("events_df", [])) > 0
     has_product = product_data is not None and len(product_data.get("runs", [])) > 0
 
     sheets = {}
@@ -279,6 +293,16 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
     sc.append({"Metric": "", "3rd Shift": "", "Plant Avg": "", "2nd Shift (Best)": "", "Gap vs 2nd": ""})
     sc.append(sc_row("Cases/Hour", f"{s3_cph:,.0f}", f"{plant_cph:,.0f}", f"{s2_cph:,.0f}",
                       f"-{s2_cph - s3_cph:,.0f} CPH"))
+    sc.append({"Metric": "", "3rd Shift": "", "Plant Avg": "", "2nd Shift (Best)": "", "Gap vs 2nd": ""})
+    util_gap = s2_util - s3_util
+    sc.append(sc_row("Utilization", f"{s3_util:.1f}%", f"{plant_util:.1f}%", f"{s2_util:.1f}%",
+                      f"{'-' if util_gap > 0 else '+'}{abs(util_gap):.1f} pts"))
+    sc.append(sc_row("Running OEE (When Up)", f"{s3_oee:.1f}%", f"{plant_oee:.1f}%", f"{s2_oee:.1f}%",
+                      f"-{s2_oee - s3_oee:.1f} pts"))
+    s3_sched_count = len(h3[h3["total_hours"] > 0])
+    sc.append(sc_row("Dead Hours (0 Cases)", f"{s3_dead} of {s3_sched_count} ({s3_dead/max(s3_sched_count,1)*100:.0f}%)",
+                      "", "", "Intervals with zero production"))
+    sc.append({"Metric": "", "3rd Shift": "", "Plant Avg": "", "2nd Shift (Best)": "", "Gap vs 2nd": ""})
     sc.append(sc_row("Total Cases", f"{s3_cases:,.0f}", "", "", ""))
     sc.append(sc_row("Production Hours", f"{s3_hours:,.1f}", "", "", ""))
     sc.append(sc_row("Shift-Days", f"{n_days}", "", "", ""))
@@ -405,6 +429,7 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
 
     # If we have product data, build a date->product lookup
     date_product_map = {}
+    date_notes_map = {}  # date -> operator notes text
     if has_product:
         for _, prow in product_data["runs"].iterrows():
             d = prow["date"]
@@ -413,6 +438,27 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
                 date_product_map[d] += f", {pf}"
             else:
                 date_product_map[d] = pf
+            # Collect operator notes for dead hour enrichment
+            notes = prow.get("notes", "")
+            if notes and not pd.isna(notes):
+                equips = prow.get("equipment_mentioned", [])
+                if d in date_notes_map:
+                    date_notes_map[d]["equips"].update(equips)
+                else:
+                    date_notes_map[d] = {"equips": set(equips)}
+
+    # Build dead hours per date for Day by Day column
+    dead_blocks_3rd, dead_summary_3rd = _build_dead_hour_narrative(h3)
+    # Enrich with event causes if available
+    if has_events:
+        dead_blocks_3rd = _correlate_dead_hours_with_events(
+            dead_blocks_3rd, downtime["events_df"], h3)
+    dead_by_date = {}
+    for b in dead_blocks_3rd:
+        d = b["date_str"]
+        if d not in dead_by_date:
+            dead_by_date[d] = []
+        dead_by_date[d].append(b)
 
     for _, row in ss3_sorted.iterrows():
         date = row["date_str"]
@@ -432,6 +478,26 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
         # Look up product for this date
         prod_running = date_product_map.get(date, "")
 
+        # Dead hours context for this date
+        dead_info = ""
+        date_blocks = dead_by_date.get(date, [])
+        if date_blocks:
+            n_dead = sum(b["n_hours"] for b in date_blocks)
+            parts = []
+            for b in date_blocks:
+                if b["n_hours"] >= 2:
+                    parts.append(f"Hr {b['first_hour']}–{b['last_hour']} ({b['n_hours']}hr outage)")
+                else:
+                    parts.append(f"Hr {b['first_hour']}")
+            dead_info = f"{n_dead} dead: {', '.join(parts)}"
+            # Use machine-data causes (from events_df) if available, else operator notes
+            machine_causes = [b.get("cause_annotation", "") for b in date_blocks if b.get("cause_annotation")]
+            if machine_causes:
+                dead_info += f" [{machine_causes[0]}]"
+            elif date in date_notes_map and date_notes_map[date]["equips"]:
+                equip_list = ", ".join(sorted(date_notes_map[date]["equips"]))
+                dead_info += f" [{equip_list}]"
+
         entry = {
             "Date": date,
             "Day": dow,
@@ -439,6 +505,7 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
             "Cases/Hr": f"{row['cases_per_hour']:,.0f}",
             "Total Cases": f"{row['total_cases']:,.0f}",
             "2nd Shift OEE": s2_oee_day,
+            "Dead Hours": dead_info,
             "Status": flag,
         }
         if has_product:
@@ -456,12 +523,12 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
         else:
             trend = f"FLAT: first half avg {first_half:.1f}%, second half {second_half:.1f}%"
         empty = {"Date": "", "Day": "", "OEE %": "", "Cases/Hr": "", "Total Cases": "",
-                 "2nd Shift OEE": "", "Status": ""}
+                 "2nd Shift OEE": "", "Dead Hours": "", "Status": ""}
         if has_product:
             empty["Product Running"] = ""
         dbd.append(empty)
         trend_row = {"Date": "TREND", "Day": trend, "OEE %": "", "Cases/Hr": "", "Total Cases": "",
-                     "2nd Shift OEE": "", "Status": ""}
+                     "2nd Shift OEE": "", "Dead Hours": "", "Status": ""}
         if has_product:
             trend_row["Product Running"] = ""
         dbd.append(trend_row)
@@ -473,19 +540,20 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
         entry = {"Date": label,
                  "Day": f"{day['date_str']} ({pd.Timestamp(day['date_str']).day_name()})",
                  "OEE %": f"{day['oee_pct']:.1f}%", "Cases/Hr": f"{day['cases_per_hour']:,.0f}",
-                 "Total Cases": f"{day['total_cases']:,.0f}", "2nd Shift OEE": "", "Status": ""}
+                 "Total Cases": f"{day['total_cases']:,.0f}", "2nd Shift OEE": "",
+                 "Dead Hours": "", "Status": ""}
         if has_product:
             entry["Product Running"] = date_product_map.get(day["date_str"], "")
         dbd.append(entry)
 
     # Day of week summary
     empty = {"Date": "", "Day": "", "OEE %": "", "Cases/Hr": "", "Total Cases": "",
-             "2nd Shift OEE": "", "Status": ""}
+             "2nd Shift OEE": "", "Dead Hours": "", "Status": ""}
     if has_product:
         empty["Product Running"] = ""
     dbd.append(empty)
     header = {"Date": "DAY OF WEEK AVG", "Day": "", "OEE %": "", "Cases/Hr": "", "Total Cases": "",
-              "2nd Shift OEE": "", "Status": ""}
+              "2nd Shift OEE": "", "Dead Hours": "", "Status": ""}
     if has_product:
         header["Product Running"] = ""
     dbd.append(header)
@@ -505,7 +573,8 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
         entry = {
             "Date": day_name, "Day": f"{int(drow['n'])} hours",
             "OEE %": f"{drow['avg_oee']:.1f}%", "Cases/Hr": f"{drow['avg_cph']:,.0f}",
-            "Total Cases": f"{drow['total_cases']:,.0f}", "2nd Shift OEE": "", "Status": flag
+            "Total Cases": f"{drow['total_cases']:,.0f}", "2nd Shift OEE": "",
+            "Dead Hours": "", "Status": flag
         }
         if has_product:
             entry["Product Running"] = ""
@@ -575,6 +644,16 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
                "What This Means": "Line runs slower on 3rd" if perf_gap > 2 else "Similar speed"})
     vs.append({"Metric": "Cases/Hour", "3rd Shift": f"{s3_cph:,.0f}", "2nd Shift": f"{s2_cph:,.0f}",
                "Difference": f"-{cph_gap:,.0f}", "What This Means": f"{cph_gap:,.0f} cases/hr left on the table"})
+
+    vs.append({"Metric": "", "3rd Shift": "", "2nd Shift": "", "Difference": "", "What This Means": ""})
+    vs.append({"Metric": "UTILIZATION", "3rd Shift": "", "2nd Shift": "", "Difference": "", "What This Means": ""})
+    util_gap_vs = s2_util - s3_util
+    vs.append({"Metric": "Utilization (% Time Producing)", "3rd Shift": f"{s3_util:.1f}%",
+               "2nd Shift": f"{s2_util:.1f}%",
+               "Difference": f"{'-' if util_gap_vs > 0 else '+'}{abs(util_gap_vs):.1f} pts",
+               "What This Means": "% of scheduled hours that had any production"})
+    vs.append({"Metric": "Dead Hours (0 Cases)", "3rd Shift": str(s3_dead), "2nd Shift": str(s2_dead),
+               "Difference": "", "What This Means": "Intervals with zero output"})
 
     vs.append({"Metric": "", "3rd Shift": "", "2nd Shift": "", "Difference": "", "What This Means": ""})
     vs.append({"Metric": "HOUR-BY-HOUR GAP", "3rd Shift": "3rd OEE", "2nd Shift": "2nd OEE",
@@ -1260,6 +1339,9 @@ def write_report(sheets, output_path):
             if sheet_name == "Day by Day":
                 status_col = list(df.columns).index("Status") if "Status" in df.columns else 6
                 ws.set_column(status_col, status_col, 12)
+                if "Dead Hours" in df.columns:
+                    dh_col = list(df.columns).index("Dead Hours")
+                    ws.set_column(dh_col, dh_col, 45)
                 if "Product Running" in df.columns:
                     prod_col = list(df.columns).index("Product Running")
                     ws.set_column(prod_col, prod_col, 35)

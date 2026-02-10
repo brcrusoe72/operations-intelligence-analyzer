@@ -50,6 +50,7 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
         avg_perf = _parse_pct(lookup.get("Average Performance", "0"))
         avg_qual = _parse_pct(lookup.get("Average Quality", "0"))
         cases_lost = _parse_num(lookup.get("Est. Cases Lost vs Benchmark", "0"))
+        utilization = _parse_pct(lookup.get("Utilization (% Time Producing)", "0"))
 
     shifts = []
     loss_df = results.get("Loss Breakdown")
@@ -85,6 +86,7 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
         "avg_availability": round(avg_avail, 1),
         "avg_performance": round(avg_perf, 1),
         "avg_quality": round(avg_qual, 1),
+        "utilization": round(utilization, 1),
         "avg_cph": round(avg_cph, 0),
         "total_cases": round(total_cases, 0),
         "total_hours": round(total_hours, 1),
@@ -130,6 +132,7 @@ def load_history():
         "avg_availability": r["avg_availability"],
         "avg_performance": r["avg_performance"],
         "avg_quality": r["avg_quality"],
+        "utilization": r.get("utilization", 0.0),
         "avg_cph": r["avg_cph"],
         "total_cases": r["total_cases"],
         "total_hours": r["total_hours"],

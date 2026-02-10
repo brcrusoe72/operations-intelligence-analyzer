@@ -279,6 +279,212 @@ def _aggregate_oee(df):
     return availability, performance, quality, oee
 
 
+def _compute_utilization(df):
+    """What % of scheduled time actually had production?
+
+    Looks at hourly intervals: scheduled = total_hours > 0,
+    producing = total_cases > 0.  Returns tuple:
+        (utilization_pct, producing_hours, scheduled_hours, dead_hours_count)
+    """
+    scheduled = df[df["total_hours"] > 0]
+    scheduled_hours = scheduled["total_hours"].sum()
+    producing = scheduled[scheduled["total_cases"] > 0]
+    producing_hours = producing["total_hours"].sum()
+    dead_count = len(scheduled) - len(producing)
+    utilization = producing_hours / scheduled_hours * 100 if scheduled_hours > 0 else 0.0
+    return utilization, producing_hours, scheduled_hours, dead_count
+
+
+def _build_dead_hour_narrative(hourly):
+    """Group consecutive dead hours (0 cases) into outage blocks.
+
+    A "dead hour" is an interval with total_hours > 0 but total_cases == 0.
+    Consecutive dead hours on the same date and shift become an "outage block".
+    Isolated dead hours are classified as "scattered".
+
+    Returns a list of dicts, each representing one block or scattered hour:
+        {date_str, shift, first_hour, last_hour, n_hours, pattern}
+    Also returns a summary dict:
+        {total_dead, consecutive_hours, scattered_hours, n_blocks}
+    """
+    dead = hourly[(hourly["total_hours"] > 0) & (hourly["total_cases"] == 0)].copy()
+    if len(dead) == 0:
+        return [], {"total_dead": 0, "consecutive_hours": 0,
+                     "scattered_hours": 0, "n_blocks": 0}
+
+    dead = dead.sort_values(["date_str", "shift", "shift_hour"]).reset_index(drop=True)
+
+    blocks = []
+    current_block = {
+        "date_str": dead.iloc[0]["date_str"],
+        "shift": dead.iloc[0]["shift"],
+        "first_hour": int(dead.iloc[0]["shift_hour"]),
+        "last_hour": int(dead.iloc[0]["shift_hour"]),
+        "n_hours": 1,
+    }
+
+    for i in range(1, len(dead)):
+        row = dead.iloc[i]
+        prev = dead.iloc[i - 1]
+        # Consecutive if same date, same shift, and hour increments by 1
+        if (row["date_str"] == prev["date_str"]
+                and row["shift"] == prev["shift"]
+                and int(row["shift_hour"]) == int(prev["shift_hour"]) + 1):
+            current_block["last_hour"] = int(row["shift_hour"])
+            current_block["n_hours"] += 1
+        else:
+            blocks.append(current_block)
+            current_block = {
+                "date_str": row["date_str"],
+                "shift": row["shift"],
+                "first_hour": int(row["shift_hour"]),
+                "last_hour": int(row["shift_hour"]),
+                "n_hours": 1,
+            }
+    blocks.append(current_block)
+
+    # Classify each block
+    for b in blocks:
+        if b["n_hours"] >= 2:
+            b["pattern"] = "consecutive"
+        else:
+            b["pattern"] = "scattered"
+
+    consecutive_hours = sum(b["n_hours"] for b in blocks if b["pattern"] == "consecutive")
+    scattered_hours = sum(b["n_hours"] for b in blocks if b["pattern"] == "scattered")
+    n_blocks = sum(1 for b in blocks if b["pattern"] == "consecutive")
+
+    summary = {
+        "total_dead": len(dead),
+        "consecutive_hours": consecutive_hours,
+        "scattered_hours": scattered_hours,
+        "n_blocks": n_blocks,
+    }
+
+    return blocks, summary
+
+
+def _correlate_dead_hours_with_events(dead_blocks, events_df, hourly):
+    """Annotate dead hour blocks with machine-data causes from individual events.
+
+    For each dead block, finds events that overlap those clock hours and
+    aggregates them by reason code. Also looks up what product was running.
+
+    Args:
+        dead_blocks: list of dicts from _build_dead_hour_narrative()
+        events_df: DataFrame with columns [reason, start_time, end_time, shift, duration_minutes]
+        hourly: hourly DataFrame with date_str, shift, shift_hour, product_code columns
+
+    Returns:
+        list of dead blocks enriched with 'causes' (str) and 'product' (str)
+    """
+    from parse_traksys import SHIFT_STARTS
+
+    if len(events_df) == 0 or len(dead_blocks) == 0:
+        return dead_blocks
+
+    # Build event-to-clock-hour lookup: (date_str, clock_hour) -> [(reason, overlap_min)]
+    hour_events = {}
+    for _, ev in events_df.iterrows():
+        start = ev["start_time"]
+        end = ev.get("end_time")
+        if pd.isna(start) or start is None:
+            continue
+        if pd.isna(end) or end is None:
+            # No end time — use start hour only, full duration
+            end = start + timedelta(minutes=ev["duration_minutes"]) if ev["duration_minutes"] > 0 else start + timedelta(hours=1)
+
+        # Walk through each clock hour this event spans
+        cur = start.replace(minute=0, second=0, microsecond=0)
+        while cur < end:
+            next_hr = cur + timedelta(hours=1)
+            # Overlap: max(start, cur) to min(end, next_hr)
+            overlap_start = max(start, cur)
+            overlap_end = min(end, next_hr)
+            overlap_min = (overlap_end - overlap_start).total_seconds() / 60.0
+            if overlap_min > 0:
+                date_str = cur.strftime("%Y-%m-%d")
+                clock_hour = cur.hour
+                key = (date_str, clock_hour)
+                if key not in hour_events:
+                    hour_events[key] = []
+                hour_events[key].append((ev["reason"], round(overlap_min, 1)))
+            cur = next_hr
+
+    # Build product lookup from hourly data: (date_str, shift_hour) -> product_code
+    product_lookup = {}
+    if "product_code" in hourly.columns:
+        for _, hr in hourly.iterrows():
+            key = (hr["date_str"], hr["shift"], int(hr["shift_hour"]))
+            pc = hr.get("product_code", "")
+            if pc and str(pc).strip():
+                product_lookup[key] = str(pc).strip()
+
+    # Annotate each dead block
+    enriched = []
+    for block in dead_blocks:
+        b = dict(block)
+        date_str = b["date_str"]
+        shift = b["shift"]
+        first_hr = b["first_hour"]
+        last_hr = b["last_hour"]
+
+        # Determine shift start hour to convert shift_hour -> clock_hour
+        # Normalize shift name for SHIFT_STARTS lookup
+        shift_key = None
+        for k in SHIFT_STARTS:
+            if k.lower().split()[0] in shift.lower():
+                shift_key = k
+                break
+        start_hour = SHIFT_STARTS.get(shift_key, 7) if shift_key else 7
+
+        # Collect events across all clock hours in this block
+        all_events = []
+        products = set()
+        for sh in range(first_hr, last_hr + 1):
+            clock_hour = (start_hour + sh - 1) % 24
+            # Calendar date: for 3rd shift, hours after midnight are next calendar day
+            cal_date_str = date_str
+            if "3rd" in shift.lower() and clock_hour < 7:
+                try:
+                    cal_date = datetime.strptime(date_str, "%Y-%m-%d").date() + timedelta(days=1)
+                    cal_date_str = cal_date.strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+
+            key = (cal_date_str, clock_hour)
+            if key in hour_events:
+                all_events.extend(hour_events[key])
+
+            # Look up product
+            prod_key = (date_str, shift, sh)
+            if prod_key in product_lookup:
+                products.add(product_lookup[prod_key])
+
+        # Aggregate events by reason
+        if all_events:
+            reason_totals = {}
+            for reason, mins in all_events:
+                reason_totals[reason] = reason_totals.get(reason, 0) + mins
+            sorted_reasons = sorted(reason_totals.items(), key=lambda x: -x[1])
+            cause_parts = [f"{r}: {m:.0f} min" for r, m in sorted_reasons[:5]]
+            b["causes"] = "; ".join(cause_parts)
+        else:
+            b["causes"] = ""
+
+        b["product"] = ", ".join(sorted(products)) if products else ""
+
+        # Combine into annotation string
+        annotation = b["causes"]
+        if b["product"]:
+            annotation += f" — running {b['product']}" if annotation else b["product"]
+        b["cause_annotation"] = annotation
+
+        enriched.append(b)
+
+    return enriched
+
+
 def _match_sheet(expected_name, available_sheets, already_matched):
     """Return the actual sheet name that best matches *expected_name*.
 
@@ -785,6 +991,14 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     add_exec("Average Performance", f"{avg_perf:.1%}")
     add_exec("Average Quality", f"{avg_qual:.1%}")
     add_exec("", "")
+
+    # Utilization — what % of scheduled time had production?
+    util_pct, prod_hours, sched_hours, dead_count = _compute_utilization(hourly)
+    add_exec("Utilization (% Time Producing)", f"{util_pct:.1f}%")
+    add_exec("Running OEE (When Line Is Up)", f"{avg_oee:.1f}%")
+    add_exec("Dead Hours (0 Cases)", f"{prod_hours:.1f} producing of {sched_hours:.1f} scheduled ({dead_count} dead intervals)")
+    add_exec("", "")
+
     add_exec("Best Shift", f"{top_shift['shift']} ({top_shift['oee_pct']:.1f}% OEE)")
     add_exec("Worst Shift", f"{bot_shift['shift']} ({bot_shift['oee_pct']:.1f}% OEE)")
     add_exec("Shift Gap", f"{top_shift['oee_pct'] - bot_shift['oee_pct']:.1f} OEE points")
@@ -866,12 +1080,15 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     for shift_name_lb in hourly["shift"].unique():
         shift_data = hourly[hourly["shift"] == shift_name_lb]
         sa, sp, sq, soee = _aggregate_oee(shift_data)
+        s_util, s_prod_hrs, s_sched_hrs, s_dead = _compute_utilization(shift_data)
         loss_rows.append({
             "shift": shift_name_lb,
             "avg_availability": sa,
             "avg_performance": sp,
             "avg_quality": sq,
             "avg_oee": round(soee, 1),
+            "utilization": round(s_util, 1),
+            "dead_hours": s_dead,
             "total_cases_lost": round(shift_data["cases_gap"].sum(), 0),
         })
     loss_by_shift = pd.DataFrame(loss_rows)
@@ -883,11 +1100,110 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     loss_by_shift["primary_loss"] = loss_by_shift.apply(
         lambda r: "Availability" if r["avail_loss_%"] >= r["perf_loss_%"] else "Performance", axis=1)
 
-    loss_out = loss_by_shift[["shift", "avg_oee", "avail_loss_%", "perf_loss_%", "qual_loss_%",
+    loss_out = loss_by_shift[["shift", "avg_oee", "utilization", "dead_hours",
+                               "avail_loss_%", "perf_loss_%", "qual_loss_%",
                                "primary_loss", "total_cases_lost"]].copy()
-    loss_out.columns = ["Shift", "Avg OEE %", "Avail Loss %", "Perf Loss %", "Qual Loss %",
+    loss_out.columns = ["Shift", "Avg OEE %", "Utilization %", "Dead Hours",
+                        "Avail Loss %", "Perf Loss %", "Qual Loss %",
                         "Primary Loss Driver", "Cases Lost"]
     results["Loss Breakdown"] = loss_out
+
+    # ===================================================================
+    # TAB: DEAD HOURS
+    # ===================================================================
+    dead_blocks, dead_summary = _build_dead_hour_narrative(hourly)
+    has_events = has_downtime and len(downtime.get("events_df", [])) > 0
+
+    if dead_summary["total_dead"] > 0:
+        # Enrich dead blocks with event causes if available
+        if has_events:
+            dead_blocks = _correlate_dead_hours_with_events(
+                dead_blocks, downtime["events_df"], hourly)
+
+        dh_rows = []
+        # Summary line
+        per_shift_dead = (
+            hourly[(hourly["total_hours"] > 0) & (hourly["total_cases"] == 0)]
+            .groupby("shift")
+            .size()
+        )
+        shift_parts = [f"{count} on {s}" for s, count in per_shift_dead.items()]
+        summary_text = (
+            f"{dead_summary['total_dead']} dead hours of "
+            f"{len(hourly[hourly['total_hours'] > 0])} scheduled "
+            f"({dead_summary['total_dead'] / max(len(hourly[hourly['total_hours'] > 0]), 1) * 100:.0f}%)"
+        )
+        if shift_parts:
+            summary_text += f" — {', '.join(shift_parts)}"
+
+        dh_row_base = {"Date": "", "Shift": "", "Hours": "", "Duration": "", "Pattern": ""}
+        if has_events:
+            dh_row_base["Cause (Machine Data)"] = ""
+
+        row = dict(dh_row_base)
+        row.update({"Date": "SUMMARY", "Shift": summary_text})
+        dh_rows.append(row)
+
+        if dead_summary["n_blocks"] > 0:
+            row = dict(dh_row_base)
+            row["Shift"] = (
+                f"{dead_summary['consecutive_hours']} hours in "
+                f"{dead_summary['n_blocks']} consecutive outages, "
+                f"{dead_summary['scattered_hours']} scattered"
+            )
+            dh_rows.append(row)
+        dh_rows.append(dict(dh_row_base))
+
+        # Outage blocks table
+        for b in dead_blocks:
+            if b["n_hours"] >= 2:
+                hr_label = f"Hr {b['first_hour']}–{b['last_hour']}"
+            else:
+                hr_label = f"Hr {b['first_hour']}"
+            row = dict(dh_row_base)
+            row.update({
+                "Date": b["date_str"],
+                "Shift": b["shift"],
+                "Hours": hr_label,
+                "Duration": f"{b['n_hours']} hr{'s' if b['n_hours'] != 1 else ''}",
+                "Pattern": b["pattern"],
+            })
+            if has_events:
+                row["Cause (Machine Data)"] = b.get("cause_annotation", "")
+            dh_rows.append(row)
+
+        # Shift comparison
+        dh_rows.append(dict(dh_row_base))
+        row = dict(dh_row_base)
+        row.update({"Date": "SHIFT COMPARISON", "Shift": "Dead Hours", "Hours": "% of Scheduled"})
+        dh_rows.append(row)
+
+        for shift_name_dh in hourly["shift"].unique():
+            s_data = hourly[hourly["shift"] == shift_name_dh]
+            s_sched = len(s_data[s_data["total_hours"] > 0])
+            s_dead = len(s_data[(s_data["total_hours"] > 0) & (s_data["total_cases"] == 0)])
+            s_pct = s_dead / s_sched * 100 if s_sched > 0 else 0
+            row = dict(dh_row_base)
+            row.update({"Date": shift_name_dh, "Shift": str(s_dead), "Hours": f"{s_pct:.1f}%"})
+            dh_rows.append(row)
+
+        results["Dead Hours"] = pd.DataFrame(dh_rows)
+
+    # ===================================================================
+    # TAB: SHIFT DOWNTIME PARETO (when individual events available)
+    # ===================================================================
+    if has_events:
+        shift_reasons_df = downtime.get("shift_reasons_df")
+        if shift_reasons_df is not None and len(shift_reasons_df) > 0:
+            srd = shift_reasons_df.copy()
+            # Compute % of shift total
+            shift_totals = srd.groupby("shift")["total_minutes"].transform("sum")
+            srd["pct_of_shift"] = (srd["total_minutes"] / shift_totals.replace(0, np.nan) * 100).fillna(0).round(1)
+            srd = srd.sort_values(["shift", "total_minutes"], ascending=[True, False])
+
+            sd_out = srd[["shift", "reason", "count", "total_minutes", "pct_of_shift"]].copy()
+            sd_out.columns = ["Shift", "Cause", "Events", "Minutes", "% of Shift Total"]
+            results["Shift Downtime"] = sd_out
 
     # ===================================================================
     # TAB 7: DOWNTIME PARETO
@@ -1215,7 +1531,8 @@ def write_excel(results, output_path):
         sheet_order = [
             "Executive Summary",
             # Shift deep dives will be inserted dynamically
-            "Shift Comparison", "Loss Breakdown",
+            "Shift Comparison", "Loss Breakdown", "Dead Hours",
+            "Shift Downtime",
             "Downtime Pareto", "Fault Summary", "Fault Detail",
             "Worst Hours", "Daily Trend", "Shift x Day OEE",
             "What to Focus On",
@@ -1310,6 +1627,33 @@ def write_excel(results, output_path):
                 ws.set_column(4, 4, 40)
                 ws.set_column(5, 5, 35)
 
+            # Dead Hours
+            if sheet_name == "Dead Hours":
+                ws.set_column(0, 0, 18)   # Date
+                ws.set_column(1, 1, 40)   # Shift / summary text
+                ws.set_column(2, 2, 16)   # Hours
+                ws.set_column(3, 3, 12)   # Duration
+                ws.set_column(4, 4, 14)   # Pattern
+                if "Cause (Machine Data)" in df.columns:
+                    cause_col = list(df.columns).index("Cause (Machine Data)")
+                    ws.set_column(cause_col, cause_col, 65)
+                # Bold section headers (SUMMARY, SHIFT COMPARISON)
+                for row_num in range(len(df)):
+                    val = str(df.iloc[row_num].get("Date", ""))
+                    if val in ("SUMMARY", "SHIFT COMPARISON"):
+                        ws.write(row_num + 3, 0, val, section_fmt)
+
+            # Shift Downtime
+            if sheet_name == "Shift Downtime":
+                ws.set_column(0, 0, 18)   # Shift
+                ws.set_column(1, 1, 35)   # Cause
+                if "Minutes" in df.columns:
+                    col_idx = list(df.columns).index("Minutes")
+                    ws.conditional_format(3, col_idx, 3 + len(df), col_idx, {
+                        "type": "3_color_scale",
+                        "min_color": "#63BE7B", "mid_color": "#FFEB84", "max_color": "#F8696B",
+                    })
+
             # Shift x Day heatmap
             if sheet_name == "Shift x Day OEE":
                 for col_num in range(1, len(df.columns)):
@@ -1359,7 +1703,16 @@ def main():
     if downtime_file:
         downtime_file = os.path.abspath(downtime_file)
         if os.path.exists(downtime_file):
-            downtime = load_downtime_data(downtime_file)
+            if downtime_file.lower().endswith(".json"):
+                downtime = load_downtime_data(downtime_file)
+            else:
+                from parse_traksys import detect_file_type, parse_event_summary
+                dt_type = detect_file_type(downtime_file)
+                if dt_type == "event_summary":
+                    print("  Detected: Traksys Event Summary export")
+                    downtime = parse_event_summary(downtime_file)
+                else:
+                    print(f"  Warning: Unrecognized downtime file format ({dt_type})")
         else:
             print(f"Warning: Downtime file not found: {downtime_file}")
 

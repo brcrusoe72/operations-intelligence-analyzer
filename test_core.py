@@ -13,6 +13,7 @@ from analyze import (
     _aggregate_oee, _smart_rename, _weighted_mean, EXPECTED_SHEETS,
     _compute_utilization, _build_dead_hour_narrative,
     _correlate_dead_hours_with_events,
+    _compute_shift_data, _build_shift_narrative,
 )
 from datetime import datetime, timedelta
 
@@ -563,3 +564,176 @@ class TestParseEventSummaryContract:
         # Verify by creating a minimal DataFrame matching the contract
         df = pd.DataFrame(columns=list(expected_cols))
         assert expected_cols == set(df.columns)
+
+
+# =====================================================================
+# _compute_shift_data — shift-centric metrics
+# =====================================================================
+
+class TestComputeShiftData:
+    """_compute_shift_data should return a dict with all expected keys."""
+
+    def _make_hourly(self):
+        """Minimal hourly DataFrame with 2 hours of production for one shift."""
+        return pd.DataFrame([
+            {"date": pd.Timestamp("2026-02-06"), "date_str": "2026-02-06",
+             "shift": "1st (7a-3p)", "shift_hour": 1, "total_hours": 1.0,
+             "total_cases": 200, "good_cases": 195, "availability": 0.9,
+             "performance": 0.8, "quality": 0.975, "oee_pct": 70.2,
+             "cases_per_hour": 200, "product_code": "8PK"},
+            {"date": pd.Timestamp("2026-02-06"), "date_str": "2026-02-06",
+             "shift": "1st (7a-3p)", "shift_hour": 2, "total_hours": 1.0,
+             "total_cases": 150, "good_cases": 148, "availability": 0.85,
+             "performance": 0.75, "quality": 0.987, "oee_pct": 62.9,
+             "cases_per_hour": 150, "product_code": "8PK"},
+        ])
+
+    def _make_shift_summary(self):
+        return pd.DataFrame([{
+            "date_str": "2026-02-06", "shift": "1st (7a-3p)",
+            "total_hours": 2.0, "total_cases": 350, "good_cases": 343,
+        }])
+
+    def _make_overall(self):
+        return pd.DataFrame([{
+            "shift": "1st (7a-3p)", "oee_pct": 66.6,
+            "cases_per_hour": 175, "total_cases": 350,
+        }])
+
+    def test_returns_expected_keys(self):
+        result = _compute_shift_data(
+            "1st (7a-3p)", self._make_hourly(), self._make_shift_summary(),
+            self._make_overall(), None, 30.0, 200.0
+        )
+        assert result is not None
+        expected_keys = {"scorecard", "loss_breakdown", "downtime_causes",
+                         "hour_by_hour", "dead_hours", "worst_hours", "raw"}
+        assert set(result.keys()) == expected_keys
+
+    def test_raw_has_required_fields(self):
+        result = _compute_shift_data(
+            "1st (7a-3p)", self._make_hourly(), self._make_shift_summary(),
+            self._make_overall(), None, 30.0, 200.0
+        )
+        raw = result["raw"]
+        required = ["shift_name", "oee", "avail", "perf", "qual", "cases",
+                     "hours", "cph", "n_days", "primary_loss", "target_cph"]
+        for key in required:
+            assert key in raw, f"Missing raw key: {key}"
+
+    def test_oee_is_reasonable(self):
+        result = _compute_shift_data(
+            "1st (7a-3p)", self._make_hourly(), self._make_shift_summary(),
+            self._make_overall(), None, 30.0, 200.0
+        )
+        oee = result["raw"]["oee"]
+        assert 0 <= oee <= 100, f"OEE {oee} out of range"
+
+    def test_scorecard_is_dataframe(self):
+        result = _compute_shift_data(
+            "1st (7a-3p)", self._make_hourly(), self._make_shift_summary(),
+            self._make_overall(), None, 30.0, 200.0
+        )
+        assert isinstance(result["scorecard"], pd.DataFrame)
+        assert len(result["scorecard"]) > 0
+
+    def test_returns_none_for_empty_shift(self):
+        hourly = self._make_hourly()
+        result = _compute_shift_data(
+            "3rd (11p-7a)", hourly, self._make_shift_summary(),
+            self._make_overall(), None, 30.0, 200.0
+        )
+        assert result is None
+
+    def test_shift_display_name(self):
+        result = _compute_shift_data(
+            "1st (7a-3p)", self._make_hourly(), self._make_shift_summary(),
+            self._make_overall(), None, 30.0, 200.0
+        )
+        assert result["raw"]["shift_name"] == "1st Shift"
+
+
+# =====================================================================
+# _build_shift_narrative — auto-generated narrative
+# =====================================================================
+
+class TestBuildShiftNarrative:
+    """_build_shift_narrative should produce non-empty, well-formed text."""
+
+    def _make_shift_data(self, **overrides):
+        """Build a minimal shift_data dict matching _compute_shift_data output."""
+        raw = {
+            "shift_name": "1st Shift",
+            "shift_name_data": "1st (7a-3p)",
+            "oee": 45.0,
+            "avail": 0.7,
+            "perf": 0.8,
+            "qual": 0.98,
+            "cases": 15000,
+            "hours": 8.0,
+            "cph": 1875.0,
+            "target_cph": 3750.0,
+            "target_cases": 30000,
+            "pct_of_target": 50.0,
+            "cases_gap": 15000,
+            "n_days": 1,
+            "util_pct": 75.0,
+            "prod_hours": 6.0,
+            "sched_hours": 8.0,
+            "dead_count": 2,
+            "dead_hours_total": 2,
+            "plant_avg_oee": 35.0,
+            "plant_avg_cph": 1500.0,
+            "avail_loss": 30.0,
+            "perf_loss": 20.0,
+            "qual_loss": 2.0,
+            "primary_loss": "Availability",
+            "primary_loss_pct": 57.7,
+            "top_cause": "Caser-Riverwood",
+            "top_cause_min": 120.0,
+            "top_cause_events": 3,
+        }
+        raw.update(overrides)
+        return {"raw": raw}
+
+    def test_produces_nonempty_string(self):
+        narrative = _build_shift_narrative(self._make_shift_data())
+        assert isinstance(narrative, str)
+        assert len(narrative) > 100
+
+    def test_contains_three_paragraphs(self):
+        narrative = _build_shift_narrative(self._make_shift_data())
+        paragraphs = [p.strip() for p in narrative.split("\n\n") if p.strip()]
+        assert len(paragraphs) == 3
+
+    def test_paragraph1_has_oee_and_cases(self):
+        narrative = _build_shift_narrative(self._make_shift_data())
+        p1 = narrative.split("\n\n")[0]
+        assert "45.0% OEE" in p1
+        assert "15,000 cases" in p1
+
+    def test_paragraph2_mentions_primary_loss(self):
+        narrative = _build_shift_narrative(self._make_shift_data())
+        p2 = narrative.split("\n\n")[1]
+        assert "Availability" in p2
+
+    def test_paragraph3_has_actions(self):
+        narrative = _build_shift_narrative(self._make_shift_data())
+        p3 = narrative.split("\n\n")[2]
+        assert "Focus on" in p3
+
+    def test_performance_loss_narrative(self):
+        narrative = _build_shift_narrative(self._make_shift_data(
+            primary_loss="Performance",
+            primary_loss_pct=60.0,
+            perf_loss=30.0, avail_loss=10.0,
+        ))
+        p2 = narrative.split("\n\n")[1]
+        assert "Performance was the gap" in p2
+
+    def test_no_downtime_still_works(self):
+        narrative = _build_shift_narrative(self._make_shift_data(
+            top_cause="", top_cause_min=0, top_cause_events=0,
+            dead_hours_total=0, dead_count=0,
+        ))
+        assert len(narrative) > 50

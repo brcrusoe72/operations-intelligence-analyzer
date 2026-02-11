@@ -940,9 +940,614 @@ def build_fault_classification(downtime):
 
 
 # ---------------------------------------------------------------------------
+# Shift-Centric Helpers
+# ---------------------------------------------------------------------------
+
+# Canonical shift name mapping: data names → display names
+_SHIFT_DISPLAY = {"1st": "1st Shift", "2nd": "2nd Shift", "3rd": "3rd Shift"}
+
+
+def _shift_display_name(shift_name):
+    """Map data shift names like '1st (7a-3p)' to clean display names."""
+    for prefix, display in _SHIFT_DISPLAY.items():
+        if shift_name.lower().startswith(prefix):
+            return display
+    return shift_name
+
+
+def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
+                         plant_avg_oee, plant_avg_cph):
+    """Compute all metrics for one shift, filtered day-by-day.
+
+    Returns a dict with:
+      - scorecard: DataFrame (per-day + total rows)
+      - loss_breakdown: DataFrame (Avail/Perf/Qual loss per day)
+      - downtime_causes: DataFrame (top 10 causes)
+      - hour_by_hour: DataFrame (per-date hour-by-hour detail)
+      - dead_hours: DataFrame (dead hour blocks with causes)
+      - worst_hours: DataFrame (top 10 worst hours)
+      - raw: dict of scalar values for narrative generation
+    """
+    sh = hourly[hourly["shift"] == shift_name].copy()
+    ss = shift_summary[shift_summary["shift"] == shift_name].copy()
+    ov = overall[overall["shift"] == shift_name]
+
+    if len(sh) == 0:
+        return None
+
+    has_downtime = downtime is not None and len(downtime.get("reasons_df", [])) > 0
+    has_events = has_downtime and len(downtime.get("events_df", [])) > 0
+
+    # --- Aggregate OEE ---
+    shift_avail, shift_perf, shift_qual, shift_oee = _aggregate_oee(sh)
+    shift_cases = sh["total_cases"].sum()
+    shift_hours = sh["total_hours"].sum()
+    shift_cph = shift_cases / shift_hours if shift_hours > 0 else 0
+    n_days = sh["date_str"].nunique()
+
+    # Utilization
+    util_pct, prod_hours, sched_hours, dead_count = _compute_utilization(sh)
+
+    # Product-aware target
+    if "product_code" in sh.columns:
+        sh["_tgt_cph"] = sh["product_code"].apply(get_target_cph)
+        benchmark_cph = sh[sh["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(sh[sh["total_hours"] >= 0.5]) > 0 else 0
+        sh["_tgt_cph"] = sh["_tgt_cph"].fillna(benchmark_cph)
+        target_cases_total = (sh["_tgt_cph"] * sh["total_hours"]).sum()
+        target_cph_avg = target_cases_total / shift_hours if shift_hours > 0 else benchmark_cph
+        sh.drop(columns=["_tgt_cph"], inplace=True, errors="ignore")
+    else:
+        benchmark_cph = sh[sh["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(sh[sh["total_hours"] >= 0.5]) > 0 else 0
+        target_cases_total = benchmark_cph * shift_hours
+        target_cph_avg = benchmark_cph
+
+    pct_of_target = shift_cases / target_cases_total * 100 if target_cases_total > 0 else 0
+    cases_gap = target_cases_total - shift_cases
+
+    # Loss breakdown
+    avail_loss = (1 - shift_avail) * 100
+    perf_loss = (1 - shift_perf) * 100
+    qual_loss = (1 - shift_qual) * 100
+    total_loss = avail_loss + perf_loss + qual_loss
+    if total_loss > 0:
+        primary_loss = "Availability" if avail_loss >= perf_loss and avail_loss >= qual_loss else \
+                        "Performance" if perf_loss >= qual_loss else "Quality"
+        primary_loss_pct = max(avail_loss, perf_loss, qual_loss) / total_loss * 100
+    else:
+        primary_loss = "None"
+        primary_loss_pct = 0
+
+    # --- SCORECARD (per-day rows) ---
+    scorecard_rows = []
+    dates = sorted(sh["date_str"].unique())
+    for d in dates:
+        d_data = sh[sh["date_str"] == d]
+        da, dp, dq, doee = _aggregate_oee(d_data)
+        d_cases = d_data["total_cases"].sum()
+        d_hours = d_data["total_hours"].sum()
+        d_cph = d_cases / d_hours if d_hours > 0 else 0
+        d_util, d_prod, d_sched, d_dead = _compute_utilization(d_data)
+        # Product target for this day
+        if "product_code" in d_data.columns:
+            d_data_cp = d_data.copy()
+            d_data_cp["_tgt"] = d_data_cp["product_code"].apply(get_target_cph)
+            d_bm = d_data[d_data["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(d_data[d_data["total_hours"] >= 0.5]) > 0 else 0
+            d_data_cp["_tgt"] = d_data_cp["_tgt"].fillna(d_bm)
+            d_target_cph = (d_data_cp["_tgt"] * d_data_cp["total_hours"]).sum() / d_hours if d_hours > 0 else d_bm
+        else:
+            d_target_cph = target_cph_avg
+        scorecard_rows.append({
+            "Date": d, "OEE %": round(doee, 1),
+            "Availability %": round(da * 100, 1),
+            "Performance %": round(dp * 100, 1),
+            "Quality %": round(dq * 100, 1),
+            "Cases/Hr": round(d_cph, 0),
+            "Target CPH": round(d_target_cph, 0),
+            "Total Cases": round(d_cases, 0),
+            "Hours Scheduled": round(d_sched, 1),
+            "Hours Producing": round(d_prod, 1),
+            "Dead Hours": d_dead,
+            "Utilization %": round(d_util, 1),
+        })
+    # Add totals row if multiple days
+    if len(dates) > 1:
+        scorecard_rows.append({
+            "Date": "TOTAL", "OEE %": round(shift_oee, 1),
+            "Availability %": round(shift_avail * 100, 1),
+            "Performance %": round(shift_perf * 100, 1),
+            "Quality %": round(shift_qual * 100, 1),
+            "Cases/Hr": round(shift_cph, 0),
+            "Target CPH": round(target_cph_avg, 0),
+            "Total Cases": round(shift_cases, 0),
+            "Hours Scheduled": round(sched_hours, 1),
+            "Hours Producing": round(prod_hours, 1),
+            "Dead Hours": dead_count,
+            "Utilization %": round(util_pct, 1),
+        })
+    scorecard_df = pd.DataFrame(scorecard_rows)
+
+    # --- LOSS BREAKDOWN (per day) ---
+    loss_rows = []
+    for d in dates:
+        d_data = sh[sh["date_str"] == d]
+        da, dp, dq, doee = _aggregate_oee(d_data)
+        al = (1 - da) * 100
+        pl = (1 - dp) * 100
+        ql = (1 - dq) * 100
+        tl = al + pl + ql
+        driver = "Availability" if al >= pl and al >= ql else "Performance" if pl >= ql else "Quality"
+        loss_rows.append({
+            "Date": d,
+            "Avail Loss %": round(al, 1),
+            "Perf Loss %": round(pl, 1),
+            "Qual Loss %": round(ql, 1),
+            "Total Loss %": round(tl, 1),
+            "Primary Driver": driver,
+        })
+    loss_breakdown_df = pd.DataFrame(loss_rows)
+
+    # --- DOWNTIME CAUSES (top 10) ---
+    downtime_causes_df = pd.DataFrame()
+    top_cause_str = ""
+    top_cause_min = 0
+    top_cause_events = 0
+    if has_events:
+        events_df = downtime.get("events_df")
+        if events_df is not None and len(events_df) > 0:
+            # Filter events to this shift
+            shift_events = events_df[events_df["shift"] == shift_name].copy()
+            if len(shift_events) > 0:
+                cause_agg = shift_events.groupby("reason").agg(
+                    Events=("duration_minutes", "size"),
+                    Total_Min=("duration_minutes", "sum"),
+                    Avg_Min=("duration_minutes", "mean"),
+                ).reset_index()
+                cause_agg = cause_agg.rename(columns={"reason": "Cause"})
+                cause_agg["Avg_Min"] = cause_agg["Avg_Min"].round(1)
+                cause_agg["Total_Min"] = cause_agg["Total_Min"].round(1)
+                total_shift_min = cause_agg["Total_Min"].sum()
+                cause_agg["% of Shift"] = (cause_agg["Total_Min"] / total_shift_min * 100).round(1) if total_shift_min > 0 else 0
+                cause_agg = cause_agg.sort_values("Total_Min", ascending=False).head(10).reset_index(drop=True)
+                cause_agg.columns = ["Cause", "Events", "Total Min", "Avg Min", "% of Shift"]
+                downtime_causes_df = cause_agg
+                if len(cause_agg) > 0:
+                    top_cause_str = cause_agg.iloc[0]["Cause"]
+                    top_cause_min = cause_agg.iloc[0]["Total Min"]
+                    top_cause_events = cause_agg.iloc[0]["Events"]
+    elif has_downtime:
+        # Fall back to reasons_df (not per-shift, but best available)
+        reasons_df = downtime["reasons_df"].copy()
+        actionable = reasons_df[~reasons_df["reason"].isin(EXCLUDE_REASONS)].sort_values("total_minutes", ascending=False).head(10)
+        if len(actionable) > 0:
+            total_min = actionable["total_minutes"].sum()
+            dc = actionable[["reason", "total_occurrences", "total_minutes"]].copy()
+            dc["avg_min"] = (dc["total_minutes"] / dc["total_occurrences"]).round(1)
+            dc["pct"] = (dc["total_minutes"] / total_min * 100).round(1) if total_min > 0 else 0
+            dc.columns = ["Cause", "Events", "Total Min", "Avg Min", "% of Shift"]
+            downtime_causes_df = dc
+            top_cause_str = dc.iloc[0]["Cause"]
+            top_cause_min = dc.iloc[0]["Total Min"]
+            top_cause_events = dc.iloc[0]["Events"]
+
+    # --- HOUR-BY-HOUR (per date) ---
+    hbh_rows = []
+    for d in dates:
+        d_data = sh[sh["date_str"] == d].sort_values("shift_hour")
+        for _, hrow in d_data.iterrows():
+            annotation = ""
+            # Annotate worst hours with loss type
+            a = hrow["availability"]
+            p = hrow["performance"]
+            if hrow["total_cases"] == 0:
+                annotation = "Line DOWN — 0 cases"
+            elif a < 0.5:
+                annotation = f"Avail {a:.0%} — stopped"
+            elif p < 0.5:
+                annotation = f"Perf {p:.0%} — slow"
+            hbh_rows.append({
+                "Date": d,
+                "Hour": int(hrow["shift_hour"]),
+                "Time": hrow.get("time_block", f"{int(hrow['shift_hour'])}:00"),
+                "OEE %": round(hrow["oee_pct"], 1),
+                "Cases/Hr": round(hrow["cases_per_hour"], 0),
+                "Cases": round(hrow["total_cases"], 0),
+                "What Happened": annotation,
+            })
+    hour_by_hour_df = pd.DataFrame(hbh_rows)
+
+    # --- DEAD HOURS ---
+    dead_blocks, dead_summary_info = _build_dead_hour_narrative(sh)
+    if has_events and len(dead_blocks) > 0:
+        dead_blocks = _correlate_dead_hours_with_events(
+            dead_blocks, downtime["events_df"], sh)
+
+    dh_rows = []
+    for b in dead_blocks:
+        if b["n_hours"] >= 2:
+            hr_label = f"Hr {b['first_hour']}–{b['last_hour']}"
+        else:
+            hr_label = f"Hr {b['first_hour']}"
+        dh_rows.append({
+            "Date": b["date_str"],
+            "Time Block": hr_label,
+            "Hours": b["n_hours"],
+            "Cause (Machine Data)": b.get("cause_annotation", b.get("causes", "")),
+            "Product Running": b.get("product", ""),
+        })
+    dead_hours_df = pd.DataFrame(dh_rows) if dh_rows else pd.DataFrame(
+        columns=["Date", "Time Block", "Hours", "Cause (Machine Data)", "Product Running"])
+
+    # --- WORST HOURS (top 10) ---
+    shift_active = sh[sh["total_hours"] >= 0.5]
+    worst_10 = shift_active.nsmallest(10, "oee_pct") if len(shift_active) > 0 else pd.DataFrame()
+    wh_rows = []
+    for _, wrow in worst_10.iterrows():
+        a = wrow["availability"]
+        p = wrow["performance"]
+        q = wrow["quality"]
+        if wrow["total_cases"] == 0:
+            driver = "Line DOWN — 0 cases"
+        elif a < p and a < q:
+            driver = f"Availability {a:.0%} — line stopped"
+        elif p < a and p < q:
+            driver = f"Performance {p:.0%} — running slow"
+        else:
+            driver = f"Mixed — Avail {a:.0%} / Perf {p:.0%}"
+
+        # Event annotation if available
+        event_str = ""
+        if has_events:
+            from parse_traksys import SHIFT_STARTS
+            events_df_w = downtime.get("events_df")
+            if events_df_w is not None and len(events_df_w) > 0:
+                shift_start = None
+                for sn, sh_val in SHIFT_STARTS.items():
+                    if sn in shift_name or shift_name in sn:
+                        shift_start = sh_val
+                        break
+                if shift_start is not None:
+                    clock_hour = (shift_start + int(wrow["shift_hour"]) - 1) % 24
+                    cal_date = wrow["date_str"]
+                    if "3rd" in shift_name.lower() and clock_hour < 7:
+                        cal_date = (datetime.strptime(cal_date, "%Y-%m-%d").date()
+                                    + timedelta(days=1)).strftime("%Y-%m-%d")
+                    hr_start = datetime.strptime(f"{cal_date} {clock_hour:02d}:00:00", "%Y-%m-%d %H:%M:%S")
+                    hr_end = hr_start + timedelta(hours=1)
+                    overlaps = events_df_w[
+                        (events_df_w["start_time"] < hr_end) & (events_df_w["end_time"] > hr_start)
+                    ]
+                    if len(overlaps) > 0:
+                        overlaps = overlaps.copy()
+                        overlaps["overlap"] = overlaps.apply(
+                            lambda e: (min(e["end_time"], hr_end) - max(e["start_time"], hr_start)).total_seconds() / 60, axis=1)
+                        top = overlaps.groupby("reason")["overlap"].sum().sort_values(ascending=False)
+                        event_str = "; ".join(f"{r}: {m:.0f}min" for r, m in top.head(3).items())
+
+        prod = ""
+        if "product_code" in wrow.index:
+            prod = str(wrow.get("product_code", "")).strip()
+
+        what = driver
+        if event_str:
+            what += f" | {event_str}"
+        if prod:
+            what += f" | {prod}"
+
+        wh_rows.append({
+            "Date": wrow["date_str"],
+            "Hour": int(wrow["shift_hour"]),
+            "OEE %": round(wrow["oee_pct"], 1),
+            "Cases/Hr": round(wrow["cases_per_hour"], 0),
+            "What Happened": what,
+        })
+    worst_hours_df = pd.DataFrame(wh_rows) if wh_rows else pd.DataFrame(
+        columns=["Date", "Hour", "OEE %", "Cases/Hr", "What Happened"])
+
+    # --- Raw values for narrative ---
+    raw = {
+        "shift_name": _shift_display_name(shift_name),
+        "shift_name_data": shift_name,
+        "oee": shift_oee,
+        "avail": shift_avail,
+        "perf": shift_perf,
+        "qual": shift_qual,
+        "cases": shift_cases,
+        "hours": shift_hours,
+        "cph": shift_cph,
+        "target_cph": target_cph_avg,
+        "target_cases": target_cases_total,
+        "pct_of_target": pct_of_target,
+        "cases_gap": cases_gap,
+        "n_days": n_days,
+        "util_pct": util_pct,
+        "prod_hours": prod_hours,
+        "sched_hours": sched_hours,
+        "dead_count": dead_count,
+        "dead_hours_total": dead_summary_info["total_dead"],
+        "plant_avg_oee": plant_avg_oee,
+        "plant_avg_cph": plant_avg_cph,
+        "avail_loss": avail_loss,
+        "perf_loss": perf_loss,
+        "qual_loss": qual_loss,
+        "primary_loss": primary_loss,
+        "primary_loss_pct": primary_loss_pct,
+        "top_cause": top_cause_str,
+        "top_cause_min": top_cause_min,
+        "top_cause_events": top_cause_events,
+    }
+
+    return {
+        "scorecard": scorecard_df,
+        "loss_breakdown": loss_breakdown_df,
+        "downtime_causes": downtime_causes_df,
+        "hour_by_hour": hour_by_hour_df,
+        "dead_hours": dead_hours_df,
+        "worst_hours": worst_hours_df,
+        "raw": raw,
+    }
+
+
+def _build_shift_narrative(shift_data):
+    """Generate 3-paragraph narrative from computed shift data.
+
+    Paragraph 1: What happened (OEE, cases, target, utilization)
+    Paragraph 2: Why (loss driver, downtime causes, dead hours)
+    Paragraph 3: The fix (top 2-3 actionable items with evidence)
+    """
+    r = shift_data["raw"]
+
+    # --- Paragraph 1: What happened ---
+    oee_vs_plant = r["oee"] - r["plant_avg_oee"]
+    comp_str = f"{abs(oee_vs_plant):.1f} points {'above' if oee_vs_plant > 0 else 'below'} plant average ({r['plant_avg_oee']:.1f}%)"
+
+    if r["cases_gap"] > 0:
+        gap_str = f"{r['cases_gap']:,.0f} cases short"
+    else:
+        gap_str = f"{abs(r['cases_gap']):,.0f} cases over"
+
+    p1 = (
+        f"{r['shift_name']} averaged {r['oee']:.1f}% OEE across {r['n_days']} day(s), "
+        f"producing {r['cases']:,.0f} cases in {r['prod_hours']:.1f} producing hours "
+        f"({r['util_pct']:.0f}% utilization). {comp_str}. "
+        f"Target was {r['target_cases']:,.0f} cases; actual delivery was "
+        f"{r['pct_of_target']:.0f}% of target ({gap_str})."
+    )
+
+    # --- Paragraph 2: Why ---
+    parts2 = []
+    parts2.append(
+        f"The primary loss driver was {r['primary_loss']} "
+        f"({r['primary_loss_pct']:.0f}% of total loss)."
+    )
+
+    if r["primary_loss"] == "Availability":
+        dead_str = f"{r['dead_hours_total']} hours" if r["dead_hours_total"] > 0 else "some time"
+        cause_str = ""
+        if r["top_cause"]:
+            cause_str = f" due to {r['top_cause']} ({r['top_cause_min']:.0f} min across {r['top_cause_events']} events)"
+        parts2.append(
+            f"Availability dragged OEE — the line wasn't running {dead_str}{cause_str}."
+        )
+    elif r["primary_loss"] == "Performance":
+        parts2.append(
+            f"Performance was the gap — when running, the line averaged "
+            f"{r['cph']:,.0f} CPH vs {r['target_cph']:,.0f} target."
+        )
+    elif r["primary_loss"] == "Quality":
+        bad_cases = r["cases"] * (1 - r["qual"])
+        parts2.append(
+            f"Quality losses of {r['qual_loss']:.1f}% indicate ~{bad_cases:,.0f} rejected cases."
+        )
+
+    if r["primary_loss"] != "Availability" and r["dead_hours_total"] > 0:
+        parts2.append(
+            f"Additionally, {r['dead_hours_total']} dead hours had zero production."
+        )
+
+    p2 = " ".join(parts2)
+
+    # --- Paragraph 3: The fix ---
+    fix_parts = []
+    actions = []
+
+    if r["top_cause"]:
+        recoverable = r["top_cause_min"] / 60 * r["target_cph"] * 0.5
+        actions.append(
+            f"Reduce {r['top_cause']} — {r['top_cause_min']:.0f} min across "
+            f"{r['top_cause_events']} events; 50% reduction recovers ~{recoverable:,.0f} cases"
+        )
+
+    if r["primary_loss"] == "Availability" and r["avail_loss"] > 15:
+        avail_hrs_lost = (1 - r["avail"]) * r["hours"]
+        actions.append(
+            f"Improve availability from {r['avail']:.0%} — "
+            f"{avail_hrs_lost:.0f} hrs of scheduled time not running"
+        )
+    elif r["primary_loss"] == "Performance" and r["perf_loss"] > 10:
+        actions.append(
+            f"Close speed gap — running at {r['cph']:,.0f} CPH vs {r['target_cph']:,.0f} target"
+        )
+
+    if r["dead_hours_total"] > 0:
+        recoverable_dead = r["dead_hours_total"] * r["target_cph"]
+        actions.append(
+            f"Recovering {r['dead_hours_total']} dead hours at {r['target_cph']:,.0f} CPH "
+            f"would add ~{recoverable_dead:,.0f} cases"
+        )
+
+    if actions:
+        for i, action in enumerate(actions[:3], 1):
+            fix_parts.append(f"({i}) {action}")
+        p3 = "Focus on: " + ". ".join(fix_parts) + "."
+    else:
+        p3 = "No major action items identified — shift is performing near target."
+
+    return f"{p1}\n\n{p2}\n\n{p3}"
+
+
+def _build_plant_summary(hourly, shift_summary, overall, downtime):
+    """Build the Plant Summary sheet with KPIs, shift comparison, loss breakdown, daily trend.
+
+    Returns a dict with sub-tables (same structure as shift sheets for write_excel dispatch).
+    """
+    total_cases = hourly["total_cases"].sum()
+    total_hours = hourly["total_hours"].sum()
+    avg_cph = total_cases / total_hours if total_hours > 0 else 0
+    avg_avail, avg_perf, avg_qual, avg_oee = _aggregate_oee(hourly)
+    util_pct, prod_hours, sched_hours, dead_count = _compute_utilization(hourly)
+    n_days = hourly["date_str"].nunique()
+    date_min = hourly["date"].min().strftime("%Y-%m-%d") if len(hourly) > 0 else ""
+    date_max = hourly["date"].max().strftime("%Y-%m-%d") if len(hourly) > 0 else ""
+
+    # Product-aware target
+    benchmark_cph = hourly[hourly["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(hourly[hourly["total_hours"] >= 0.5]) > 0 else 0
+    if "product_code" in hourly.columns:
+        hourly_cp = hourly.copy()
+        hourly_cp["_tgt"] = hourly_cp["product_code"].apply(get_target_cph)
+        hourly_cp["_tgt"] = hourly_cp["_tgt"].fillna(benchmark_cph)
+        product_target_total = (hourly_cp["_tgt"] * hourly_cp["total_hours"]).sum()
+        product_target_cph = product_target_total / total_hours if total_hours > 0 else benchmark_cph
+    else:
+        product_target_total = benchmark_cph * total_hours
+        product_target_cph = benchmark_cph
+
+    has_downtime = downtime is not None and len(downtime.get("reasons_df", [])) > 0
+    top_cause_str = ""
+    if has_downtime:
+        reasons_df = downtime["reasons_df"]
+        actionable = reasons_df[~reasons_df["reason"].isin(EXCLUDE_REASONS)].sort_values("total_minutes", ascending=False)
+        if len(actionable) > 0:
+            top_cause_str = f"{actionable.iloc[0]['reason']} ({actionable.iloc[0]['total_hours']:.0f} hrs)"
+
+    # --- KPIs ---
+    kpi_rows = [
+        {"Metric": "Overall OEE", "Value": f"{avg_oee:.1f}%"},
+        {"Metric": "OEE Gap to 50% Target", "Value": f"{50.0 - avg_oee:.1f} points"},
+        {"Metric": "Total Cases", "Value": f"{total_cases:,.0f}"},
+        {"Metric": "Cases vs Target (Plant Std)",
+         "Value": f"{total_cases - product_target_total:+,.0f} ({total_cases / product_target_total * 100:.0f}%)" if product_target_total > 0 else "N/A"},
+        {"Metric": "Utilization",
+         "Value": f"{util_pct:.0f}% ({prod_hours:.1f} of {sched_hours:.1f} hrs)"},
+        {"Metric": "Top Downtime Cause", "Value": top_cause_str if top_cause_str else "N/A"},
+    ]
+    kpi_df = pd.DataFrame(kpi_rows)
+
+    # --- Shift Comparison ---
+    comp_rows = []
+    for (date_val, sname), s_data in hourly.groupby(["date_str", "shift"]):
+        sa, sp, sq, soee = _aggregate_oee(s_data)
+        s_cases = s_data["total_cases"].sum()
+        s_hours = s_data["total_hours"].sum()
+        s_cph = s_cases / s_hours if s_hours > 0 else 0
+        # Product target for this shift-day
+        if "product_code" in s_data.columns:
+            s_data_cp = s_data.copy()
+            s_data_cp["_tgt"] = s_data_cp["product_code"].apply(get_target_cph)
+            s_bm = s_data[s_data["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(s_data[s_data["total_hours"] >= 0.5]) > 0 else 0
+            s_data_cp["_tgt"] = s_data_cp["_tgt"].fillna(s_bm)
+            s_target_cph = (s_data_cp["_tgt"] * s_data_cp["total_hours"]).sum() / s_hours if s_hours > 0 else s_bm
+        else:
+            s_target_cph = product_target_cph
+        s_pct = s_cph / s_target_cph * 100 if s_target_cph > 0 else 0
+        comp_rows.append({
+            "Date": date_val,
+            "Shift": _shift_display_name(sname),
+            "OEE %": round(soee, 1),
+            "Cases": round(s_cases, 0),
+            "CPH": round(s_cph, 0),
+            "Target CPH": round(s_target_cph, 0),
+            "% of Target": round(s_pct, 1),
+            "Avail %": round(sa * 100, 1),
+            "Perf %": round(sp * 100, 1),
+            "Qual %": round(sq * 100, 1),
+        })
+    shift_comp_df = pd.DataFrame(comp_rows).sort_values(["Date", "Shift"]).reset_index(drop=True)
+
+    # --- Loss Breakdown by Shift ---
+    loss_rows = []
+    for (date_val, sname), s_data in hourly.groupby(["date_str", "shift"]):
+        sa, sp, sq, soee = _aggregate_oee(s_data)
+        al = (1 - sa) * 100
+        pl = (1 - sp) * 100
+        ql = (1 - sq) * 100
+        driver = "Availability" if al >= pl and al >= ql else "Performance" if pl >= ql else "Quality"
+        s_cases = s_data["total_cases"].sum()
+        if "cases_gap" in s_data.columns:
+            cases_lost = s_data["cases_gap"].sum()
+        else:
+            cases_lost = 0
+        loss_rows.append({
+            "Date": date_val,
+            "Shift": _shift_display_name(sname),
+            "Avail Loss %": round(al, 1),
+            "Perf Loss %": round(pl, 1),
+            "Qual Loss %": round(ql, 1),
+            "Primary Driver": driver,
+            "Cases Lost": round(cases_lost, 0),
+        })
+    loss_df = pd.DataFrame(loss_rows).sort_values(["Date", "Shift"]).reset_index(drop=True)
+
+    # --- Daily Trend ---
+    if "product_code" in hourly.columns:
+        hourly_cp2 = hourly.copy()
+        hourly_cp2["_tgt"] = hourly_cp2["product_code"].apply(get_target_cph)
+        hourly_cp2["_tgt"] = hourly_cp2["_tgt"].fillna(benchmark_cph)
+        hourly_cp2["_tgt_cases"] = hourly_cp2["_tgt"] * hourly_cp2["total_hours"]
+    else:
+        hourly_cp2 = hourly.copy()
+        hourly_cp2["_tgt_cases"] = benchmark_cph * hourly_cp2["total_hours"]
+
+    daily = (
+        hourly_cp2.groupby("date_str")
+        .agg(total_cases=("total_cases", "sum"),
+             total_hours=("total_hours", "sum"),
+             target_cases=("_tgt_cases", "sum"))
+        .reset_index()
+    )
+    # Weighted OEE
+    shift_summary_cp = shift_summary.copy()
+    shift_summary_cp["_w"] = shift_summary_cp["oee_pct"] * shift_summary_cp["total_hours"]
+    daily_oee = (
+        shift_summary_cp.groupby("date_str")
+        .agg(_w=("_w", "sum"), _hrs=("total_hours", "sum"))
+        .reset_index()
+    )
+    daily_oee["avg_oee"] = (daily_oee["_w"] / daily_oee["_hrs"].replace(0, np.nan)).fillna(0).round(1)
+    daily = daily.merge(daily_oee[["date_str", "avg_oee"]], on="date_str", how="left")
+    daily["cph"] = (daily["total_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
+    daily["target_cph"] = (daily["target_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
+    daily["pct_target"] = (daily["total_cases"] / daily["target_cases"].replace(0, np.nan) * 100).fillna(0).round(1)
+    daily = daily.sort_values("date_str")
+
+    daily_trend_df = daily[["date_str", "total_hours", "cph", "target_cph",
+                            "total_cases", "target_cases", "pct_target", "avg_oee"]].copy()
+    daily_trend_df.columns = ["Date", "Sched Hours", "Cases/Hr", "Target CPH",
+                              "Actual Cases", "Target Cases", "% of Target", "OEE %"]
+    daily_trend_df["Sched Hours"] = daily_trend_df["Sched Hours"].round(1)
+    daily_trend_df["Actual Cases"] = daily_trend_df["Actual Cases"].round(0)
+    daily_trend_df["Target Cases"] = daily_trend_df["Target Cases"].round(0)
+
+    return {
+        "title": "Plant Summary — Line 2 Flex",
+        "subtitle": f"{date_min} to {date_max} · {n_days} day(s) analyzed",
+        "kpis": kpi_df,
+        "shift_comparison": shift_comp_df,
+        "loss_breakdown": loss_df,
+        "daily_trend": daily_trend_df,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main Analysis
 # ---------------------------------------------------------------------------
 def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
+    """Produce shift-centric analysis: Plant Summary + per-shift sheets + What to Focus On.
+
+    Returns dict where:
+      - "Plant Summary" → dict with sub-tables (title, subtitle, kpis, shift_comparison, etc.)
+      - "1st Shift" / "2nd Shift" / "3rd Shift" → dict with narrative + sub-tables
+      - "What to Focus On" → DataFrame (unchanged)
+    """
     results = {}
 
     # === CORE METRICS ===
@@ -952,7 +1557,7 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     avg_avail, avg_perf, avg_qual, avg_oee = _aggregate_oee(hourly)
 
     good_hours = hourly[hourly["total_hours"] >= 0.5]
-    benchmark_cph = good_hours["cases_per_hour"].quantile(0.90)
+    benchmark_cph = good_hours["cases_per_hour"].quantile(0.90) if len(good_hours) > 0 else 0
     target_cph = benchmark_cph  # fallback for non-product-aware paths
 
     # Product-aware target: use plant standards when product is known
@@ -960,7 +1565,6 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
         hourly["_prod_target_cph"] = hourly["product_code"].apply(get_target_cph)
         hourly["_prod_target_cph"] = hourly["_prod_target_cph"].fillna(benchmark_cph)
         hourly["cases_gap"] = (hourly["_prod_target_cph"] - hourly["cases_per_hour"]).clip(lower=0) * hourly["total_hours"]
-        # Compute product-aware total target for the period
         product_target_total = (hourly["_prod_target_cph"] * hourly["total_hours"]).sum()
         product_target_cph_avg = product_target_total / total_hours if total_hours > 0 else benchmark_cph
         hourly.drop(columns=["_prod_target_cph"], inplace=True, errors="ignore")
@@ -979,440 +1583,54 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     perf_loss = (1 - avg_perf) * 100
 
     has_downtime = downtime is not None and len(downtime.get("reasons_df", [])) > 0
+    has_events = has_downtime and len(downtime.get("events_df", [])) > 0
 
     shifts_sorted = overall.sort_values("oee_pct", ascending=False)
     top_shift = shifts_sorted.iloc[0]
     bot_shift = shifts_sorted.iloc[-1]
 
     # ===================================================================
-    # TAB 1: EXECUTIVE SUMMARY
+    # SHEET 1: PLANT SUMMARY
     # ===================================================================
-    exec_data = {"Metric": [], "Value": []}
-
-    def add_exec(metric, value):
-        exec_data["Metric"].append(metric)
-        exec_data["Value"].append(value)
-
-    add_exec("Date Range", f"{date_min} to {date_max}")
-    add_exec("Days Analyzed", n_days)
-    add_exec("Total Cases Produced", f"{total_cases:,.0f}")
-    add_exec("Total Production Hours", f"{total_hours:,.1f}")
-    add_exec("Average Cases/Hour", f"{avg_cph:,.0f}")
-    add_exec("Target Cases/Hour (Plant Std)", f"{product_target_cph_avg:,.0f}")
-    add_exec("90th Percentile CPH (Best Hrs)", f"{benchmark_cph:,.0f}")
-    add_exec("", "")
-    add_exec("Average OEE", f"{avg_oee:.1f}% (Target: 50%)")
-    add_exec("OEE Gap to Target", f"{50.0 - avg_oee:.1f} points to close")
-    add_exec("Average Availability", f"{avg_avail:.1%}")
-    add_exec("Average Performance", f"{avg_perf:.1%}")
-    add_exec("Average Quality", f"{avg_qual:.1%}")
-    add_exec("", "")
-
-    # Utilization — what % of scheduled time had production?
-    util_pct, prod_hours, sched_hours, dead_count = _compute_utilization(hourly)
-    add_exec("Utilization (% Time Producing)", f"{util_pct:.1f}% ({prod_hours:.1f} of {sched_hours:.1f} hrs)")
-    add_exec("Running OEE (When Line Is Up)", f"{avg_oee:.1f}%")
-    add_exec("Dead Hours (0 Cases)", f"{prod_hours:.1f} producing of {sched_hours:.1f} scheduled ({dead_count} dead intervals)")
-    add_exec("", "")
-
-    add_exec("Best Shift", f"{top_shift['shift']} ({top_shift['oee_pct']:.1f}% OEE)")
-    add_exec("Worst Shift", f"{bot_shift['shift']} ({bot_shift['oee_pct']:.1f}% OEE)")
-    add_exec("Shift Gap", f"{top_shift['oee_pct'] - bot_shift['oee_pct']:.1f} OEE points")
-    add_exec("", "")
-    add_exec("Target Cases (Plant Std)", f"{product_target_total:,.0f}")
-    add_exec("Cases vs Target", f"{total_cases - product_target_total:+,.0f}")
-    add_exec("% of Target", f"{total_cases / product_target_total * 100:.1f}%" if product_target_total > 0 else "N/A")
-
-    if has_downtime:
-        add_exec("", "")
-        add_exec("--- DOWNTIME CONTEXT ---", "")
-        meta = downtime.get("meta", {})
-        oee_sum = downtime.get("oee_summary", {})
-        if meta.get("line"):
-            add_exec("Line", meta["line"])
-        if oee_sum.get("overall_oee"):
-            add_exec("Period OEE (from Traksys)", f"{oee_sum['overall_oee']:.1%}")
-        if oee_sum.get("availability_loss_hrs"):
-            add_exec("Total Availability Loss", f"{oee_sum['availability_loss_hrs']:.1f} hours")
-
-        top_3 = downtime["reasons_df"][
-            ~downtime["reasons_df"]["reason"].isin(EXCLUDE_REASONS)
-        ].sort_values("total_minutes", ascending=False).head(3)
-        for i, (_, row) in enumerate(top_3.iterrows()):
-            add_exec(f"#{i+1} Downtime Cause", f"{row['reason']} ({row['total_hours']:.0f} hrs / {int(row['total_occurrences'])} events)")
-
-    results["Executive Summary"] = pd.DataFrame(exec_data)
+    results["Plant Summary"] = _build_plant_summary(hourly, shift_summary, overall, downtime)
 
     # ===================================================================
-    # TABS 2-4: SHIFT DEEP DIVES (3rd first, then 2nd, then 1st)
+    # SHEETS 2-4: PER-SHIFT SHEETS
     # ===================================================================
-    # Determine shift order: worst first
-    shift_order = ["3rd (11p-7a)", "2nd (3p-11p)", "1st (7a-3p)"]
-    # Fallback: use whatever shift names exist in the data
+    shift_order = ["1st (7a-3p)", "2nd (3p-11p)", "3rd (11p-7a)"]
     actual_shifts = hourly["shift"].unique().tolist()
     if not any(s in actual_shifts for s in shift_order):
-        shift_order = sorted(actual_shifts, key=lambda s: overall[overall["shift"] == s]["oee_pct"].values[0] if len(overall[overall["shift"] == s]) > 0 else 999)
+        shift_order = sorted(actual_shifts)
 
     for shift_name in shift_order:
         if shift_name not in actual_shifts:
             continue
-        dive_df = build_shift_deep_dive(
-            shift_name, hourly, shift_summary, hour_avg, overall, avg_oee, avg_cph
+        shift_data = _compute_shift_data(
+            shift_name, hourly, shift_summary, overall, downtime,
+            avg_oee, avg_cph
         )
-        if dive_df is not None:
-            # Shorten tab name to fit Excel 31-char limit
-            short = shift_name.split("(")[0].strip() if "(" in shift_name else shift_name
-            tab_name = f"{short} Deep Dive"
-            results[tab_name] = dive_df
+        if shift_data is not None:
+            narrative = _build_shift_narrative(shift_data)
+            display_name = _shift_display_name(shift_name)
+            results[display_name] = {
+                "narrative": narrative,
+                "scorecard": shift_data["scorecard"],
+                "loss_breakdown": shift_data["loss_breakdown"],
+                "downtime_causes": shift_data["downtime_causes"],
+                "hour_by_hour": shift_data["hour_by_hour"],
+                "dead_hours": shift_data["dead_hours"],
+                "worst_hours": shift_data["worst_hours"],
+                "raw": shift_data["raw"],
+            }
 
     # ===================================================================
-    # TAB 5: SHIFT COMPARISON (day by day)
+    # SHEET 5: WHAT TO FOCUS ON
     # ===================================================================
-    comp_cols = ["date_str", "shift", "oee_pct", "total_cases", "total_hours", "cases_per_hour"]
-    comp_cols = [c for c in comp_cols if c in shift_summary.columns]
-    shift_comp = shift_summary[comp_cols].copy()
-    for col in ["cases_per_hour", "total_cases"]:
-        if col in shift_comp.columns:
-            shift_comp[col] = shift_comp[col].round(0)
-    if "total_hours" in shift_comp.columns:
-        shift_comp["total_hours"] = shift_comp["total_hours"].round(1)
-    if "oee_pct" in shift_comp.columns:
-        shift_comp["oee_pct"] = shift_comp["oee_pct"].round(1)
-    for col in ["good_cases", "bad_cases"]:
-        if col in shift_summary.columns:
-            shift_comp[col] = shift_summary[col].round(0)
-    shift_comp = shift_comp.sort_values(["date_str", "shift"])
-    rename_map = {
-        "date_str": "Date", "shift": "Shift", "oee_pct": "OEE %",
-        "total_cases": "Total Cases", "total_hours": "Total Hours",
-        "cases_per_hour": "Cases/Hr", "good_cases": "Good Cases",
-        "bad_cases": "Bad Cases",
-    }
-    shift_comp = shift_comp.rename(columns=rename_map)
-    results["Shift Comparison"] = shift_comp
+    # Old tabs (Executive Summary, Shift Deep Dives, Shift Comparison,
+    # Loss Breakdown, Dead Hours, Shift Downtime, Downtime Pareto,
+    # Fault Summary/Detail, Worst Hours, Daily Trend, Shift x Day OEE)
+    # are now absorbed into Plant Summary + per-shift sheets above.
 
-    # ===================================================================
-    # TAB 6: LOSS BREAKDOWN (day by day)
-    # ===================================================================
-    loss_rows = []
-    for (date_val, shift_name_lb), shift_data in hourly.groupby(["date_str", "shift"]):
-        sa, sp, sq, soee = _aggregate_oee(shift_data)
-        loss_rows.append({
-            "date_str": date_val,
-            "shift": shift_name_lb,
-            "avg_oee": round(soee, 1),
-            "avg_availability": sa,
-            "avg_performance": sp,
-            "avg_quality": sq,
-            "total_cases": round(shift_data["total_cases"].sum(), 0),
-            "total_cases_lost": round(shift_data["cases_gap"].sum(), 0),
-        })
-    loss_by_day = pd.DataFrame(loss_rows)
-    loss_by_day["avail_loss_%"] = ((1 - loss_by_day["avg_availability"]) * 100).round(1)
-    loss_by_day["perf_loss_%"] = ((1 - loss_by_day["avg_performance"]) * 100).round(1)
-    loss_by_day["qual_loss_%"] = ((1 - loss_by_day["avg_quality"]) * 100).round(1)
-
-    loss_by_day["primary_loss"] = loss_by_day.apply(
-        lambda r: "Availability" if r["avail_loss_%"] >= r["perf_loss_%"] else "Performance", axis=1)
-
-    loss_out = loss_by_day[["date_str", "shift", "avg_oee",
-                             "avail_loss_%", "perf_loss_%", "qual_loss_%",
-                             "primary_loss", "total_cases", "total_cases_lost"]].copy()
-    loss_out = loss_out.sort_values(["date_str", "shift"])
-    loss_out.columns = ["Date", "Shift", "Avg OEE %",
-                        "Avail Loss %", "Perf Loss %", "Qual Loss %",
-                        "Primary Loss Driver", "Cases Produced", "Cases Lost"]
-    results["Loss Breakdown"] = loss_out
-
-    # ===================================================================
-    # TAB: DEAD HOURS
-    # ===================================================================
-    dead_blocks, dead_summary = _build_dead_hour_narrative(hourly)
-    has_events = has_downtime and len(downtime.get("events_df", [])) > 0
-
-    if dead_summary["total_dead"] > 0:
-        # Enrich dead blocks with event causes if available
-        if has_events:
-            dead_blocks = _correlate_dead_hours_with_events(
-                dead_blocks, downtime["events_df"], hourly)
-
-        dh_rows = []
-        # Summary line
-        per_shift_dead = (
-            hourly[(hourly["total_hours"] > 0) & (hourly["total_cases"] == 0)]
-            .groupby("shift")
-            .size()
-        )
-        shift_parts = [f"{count} on {s}" for s, count in per_shift_dead.items()]
-        summary_text = (
-            f"{dead_summary['total_dead']} dead hours of "
-            f"{len(hourly[hourly['total_hours'] > 0])} scheduled "
-            f"({dead_summary['total_dead'] / max(len(hourly[hourly['total_hours'] > 0]), 1) * 100:.0f}%)"
-        )
-        if shift_parts:
-            summary_text += f" — {', '.join(shift_parts)}"
-
-        dh_row_base = {"Date": "", "Shift": "", "Hours": "", "Duration": "", "Pattern": ""}
-        if has_events:
-            dh_row_base["Cause (Machine Data)"] = ""
-
-        row = dict(dh_row_base)
-        row.update({"Date": "SUMMARY", "Shift": summary_text})
-        dh_rows.append(row)
-
-        if dead_summary["n_blocks"] > 0:
-            row = dict(dh_row_base)
-            row["Shift"] = (
-                f"{dead_summary['consecutive_hours']} hours in "
-                f"{dead_summary['n_blocks']} consecutive outages, "
-                f"{dead_summary['scattered_hours']} scattered"
-            )
-            dh_rows.append(row)
-        dh_rows.append(dict(dh_row_base))
-
-        # Outage blocks table
-        for b in dead_blocks:
-            if b["n_hours"] >= 2:
-                hr_label = f"Hr {b['first_hour']}–{b['last_hour']}"
-            else:
-                hr_label = f"Hr {b['first_hour']}"
-            row = dict(dh_row_base)
-            row.update({
-                "Date": b["date_str"],
-                "Shift": b["shift"],
-                "Hours": hr_label,
-                "Duration": f"{b['n_hours']} hr{'s' if b['n_hours'] != 1 else ''}",
-                "Pattern": b["pattern"],
-            })
-            if has_events:
-                row["Cause (Machine Data)"] = b.get("cause_annotation", "")
-            dh_rows.append(row)
-
-        # Shift comparison
-        dh_rows.append(dict(dh_row_base))
-        row = dict(dh_row_base)
-        row.update({"Date": "SHIFT COMPARISON", "Shift": "Dead Hours", "Hours": "% of Scheduled"})
-        dh_rows.append(row)
-
-        for shift_name_dh in hourly["shift"].unique():
-            s_data = hourly[hourly["shift"] == shift_name_dh]
-            s_sched = len(s_data[s_data["total_hours"] > 0])
-            s_dead = len(s_data[(s_data["total_hours"] > 0) & (s_data["total_cases"] == 0)])
-            s_pct = s_dead / s_sched * 100 if s_sched > 0 else 0
-            row = dict(dh_row_base)
-            row.update({"Date": shift_name_dh, "Shift": str(s_dead), "Hours": f"{s_pct:.1f}%"})
-            dh_rows.append(row)
-
-        results["Dead Hours"] = pd.DataFrame(dh_rows)
-
-    # ===================================================================
-    # TAB: SHIFT DOWNTIME PARETO (when individual events available)
-    # ===================================================================
-    if has_events:
-        events_df = downtime.get("events_df")
-        if events_df is not None and len(events_df) > 0:
-            edf = events_df.copy()
-            # Derive date from start_time
-            edf["date_str"] = edf["start_time"].dt.strftime("%Y-%m-%d")
-            edf["shift"] = edf["shift"].fillna("Unassigned Shift")
-            # Group by date, shift, reason
-            srd = edf.groupby(["date_str", "shift", "reason"]).agg(
-                count=("duration_minutes", "size"),
-                total_minutes=("duration_minutes", "sum"),
-                avg_minutes=("duration_minutes", "mean"),
-                min_minutes=("duration_minutes", "min"),
-                max_minutes=("duration_minutes", "max"),
-            ).reset_index()
-            srd["avg_minutes"] = srd["avg_minutes"].round(1)
-            srd["min_minutes"] = srd["min_minutes"].round(1)
-            srd["max_minutes"] = srd["max_minutes"].round(1)
-            srd["total_minutes"] = srd["total_minutes"].round(1)
-            # % of day-shift total
-            day_shift_totals = srd.groupby(["date_str", "shift"])["total_minutes"].transform("sum")
-            srd["pct_of_shift"] = (srd["total_minutes"] / day_shift_totals.replace(0, np.nan) * 100).fillna(0).round(1)
-            srd = srd.sort_values(["date_str", "shift", "total_minutes"], ascending=[True, True, False])
-
-            sd_out = srd[["date_str", "shift", "reason", "count", "total_minutes",
-                          "avg_minutes", "min_minutes", "max_minutes", "pct_of_shift"]].copy()
-            sd_out.columns = ["Date", "Shift", "Cause", "Events", "Total Min",
-                              "Avg Min", "Shortest", "Longest", "% of Shift"]
-            results["Shift Downtime"] = sd_out
-
-    # ===================================================================
-    # TAB 7: DOWNTIME PARETO
-    # ===================================================================
-    if has_downtime:
-        reasons_df = downtime["reasons_df"].copy()
-        actionable = reasons_df[~reasons_df["reason"].isin(EXCLUDE_REASONS)].copy()
-        actionable = actionable.sort_values("total_minutes", ascending=False).reset_index(drop=True)
-
-        total_actionable_min = actionable["total_minutes"].sum()
-        actionable["pct_of_total"] = (actionable["total_minutes"] / total_actionable_min * 100).round(1)
-        actionable["cumulative_pct"] = actionable["pct_of_total"].cumsum().round(1)
-        actionable["avg_min_per_event"] = (actionable["total_minutes"] / actionable["total_occurrences"]).round(1)
-        actionable["fault_category"] = actionable["reason"].apply(classify_fault)
-
-        pareto_out = actionable[["reason", "fault_category", "total_occurrences", "total_minutes",
-                                  "total_hours", "avg_min_per_event", "pct_of_total", "cumulative_pct"]].copy()
-        pareto_out.columns = ["Cause", "Fault Type", "Events", "Total Minutes", "Total Hours",
-                              "Avg Min/Event", "% of Total", "Cumulative %"]
-        results["Downtime Pareto"] = pareto_out
-
-    # ===================================================================
-    # TAB 8: FAULT CLASSIFICATION (mechanic vs operator vs process)
-    # ===================================================================
-    if has_downtime:
-        fault_summary, fault_detail = build_fault_classification(downtime)
-        if fault_summary is not None:
-            results["Fault Summary"] = fault_summary
-        if fault_detail is not None:
-            results["Fault Detail"] = fault_detail
-
-    # ===================================================================
-    # TAB 9: WORST HOURS (all shifts) — with narrative context
-    # ===================================================================
-    worst = (
-        hourly[hourly["total_hours"] >= 0.5].nsmallest(25, "oee_pct")
-        [["date_str", "day_of_week", "shift", "shift_hour", "time_block", "cases_per_hour",
-          "oee_pct", "availability", "performance", "quality", "total_cases", "cases_gap"]]
-        .copy()
-    )
-    worst["cases_per_hour"] = worst["cases_per_hour"].round(0)
-    worst["oee_pct"] = worst["oee_pct"].round(1)
-    worst["availability"] = (worst["availability"] * 100).round(1)
-    worst["performance"] = (worst["performance"] * 100).round(1)
-    worst["quality"] = (worst["quality"] * 100).round(1)
-    worst["cases_gap"] = worst["cases_gap"].round(0)
-
-    # Build narrative: what loss type + what caused it from event data
-    narratives = []
-    for _, wrow in worst.iterrows():
-        parts = []
-        # Identify the loss type
-        avail_loss = (1 - wrow["availability"] / 100) * 100
-        perf_loss = (1 - wrow["performance"] / 100) * 100
-        if wrow["total_cases"] == 0:
-            parts.append("Line was DOWN — 0 cases produced")
-        elif avail_loss > perf_loss and avail_loss > 20:
-            parts.append(f"Availability problem ({avail_loss:.0f}% loss) — line stopped frequently")
-        elif perf_loss > 20:
-            parts.append(f"Speed problem ({perf_loss:.0f}% loss) — line running but slow")
-        else:
-            parts.append(f"Mixed losses — avail {avail_loss:.0f}%, perf {perf_loss:.0f}%")
-
-        # Look up event causes for this hour if available
-        if has_events:
-            from parse_traksys import SHIFT_STARTS
-            events_df_w = downtime.get("events_df")
-            if events_df_w is not None and len(events_df_w) > 0:
-                shift_name_w = wrow["shift"]
-                shift_start = None
-                for sn, sh in SHIFT_STARTS.items():
-                    if sn in shift_name_w or shift_name_w in sn:
-                        shift_start = sh
-                        break
-                if shift_start is not None:
-                    clock_hour = (shift_start + int(wrow["shift_hour"]) - 1) % 24
-                    cal_date = wrow["date_str"]
-                    # 3rd shift midnight crossing
-                    if "3rd" in shift_name_w and clock_hour < 7:
-                        cal_date = (datetime.strptime(cal_date, "%Y-%m-%d").date()
-                                    + timedelta(days=1)).strftime("%Y-%m-%d")
-                    # Find events overlapping this clock hour
-                    hr_start = datetime.strptime(f"{cal_date} {clock_hour:02d}:00:00", "%Y-%m-%d %H:%M:%S")
-                    hr_end = hr_start + timedelta(hours=1)
-                    overlaps = events_df_w[
-                        (events_df_w["start_time"] < hr_end) & (events_df_w["end_time"] > hr_start)
-                    ].copy()
-                    if len(overlaps) > 0:
-                        # Compute overlap minutes per event
-                        overlaps["overlap"] = overlaps.apply(
-                            lambda e: (min(e["end_time"], hr_end) - max(e["start_time"], hr_start)).total_seconds() / 60, axis=1)
-                        top_causes = overlaps.groupby("reason")["overlap"].sum().sort_values(ascending=False)
-                        cause_strs = [f"{r}: {m:.0f}min" for r, m in top_causes.head(3).items()]
-                        parts.append("Machine data: " + "; ".join(cause_strs))
-
-        # Look up product
-        if "product_code" in hourly.columns:
-            prod = wrow.get("product_code", "") if "product_code" in worst.columns else ""
-            if not prod:
-                # Look up from hourly
-                match = hourly[(hourly["date_str"] == wrow["date_str"]) &
-                               (hourly["shift"] == wrow["shift"]) &
-                               (hourly["shift_hour"] == wrow["shift_hour"])]
-                if len(match) > 0 and "product_code" in match.columns:
-                    prod = match.iloc[0].get("product_code", "")
-            if prod:
-                parts.append(f"Product: {prod}")
-
-        narratives.append(" | ".join(parts))
-
-    worst["what_happened"] = narratives
-    worst = worst.drop(columns=["shift_hour"])
-    worst.columns = ["Date", "Day", "Shift", "Hour", "Cases/Hr", "OEE %",
-                     "Avail %", "Perf %", "Qual %", "Cases", "Cases Lost", "What Happened"]
-    results["Worst Hours"] = worst
-
-    # ===================================================================
-    # TAB 10: DAILY TREND (product-aware targets from plant standards)
-    # ===================================================================
-    # Compute target CPH per hour based on product running
-    hourly["_target_cph"] = hourly["product_code"].apply(get_target_cph) if "product_code" in hourly.columns else np.nan
-    # Fallback: use 90th percentile benchmark when product unknown
-    hourly["_target_cph"] = hourly["_target_cph"].fillna(target_cph)
-    hourly["_target_cases"] = hourly["_target_cph"] * hourly["total_hours"]
-
-    shift_summary["_w_oee"] = shift_summary["oee_pct"] * shift_summary["total_hours"]
-    daily = (
-        hourly.groupby("date_str")
-        .agg(total_cases=("total_cases", "sum"),
-             total_hours=("total_hours", "sum"),
-             target_cases=("_target_cases", "sum"))
-        .reset_index()
-    )
-    hourly.drop(columns=["_target_cph", "_target_cases"], inplace=True, errors="ignore")
-
-    # Weighted OEE from shift_summary (avoids double-counting sub-hour intervals)
-    daily_oee = (
-        shift_summary.groupby("date_str")
-        .agg(_w_oee=("_w_oee", "sum"), _hrs=("total_hours", "sum"), n_shifts=("shift", "count"))
-        .reset_index()
-    )
-    daily_oee["avg_oee"] = (daily_oee["_w_oee"] / daily_oee["_hrs"].replace(0, np.nan)).fillna(0).round(1)
-    shift_summary.drop(columns=["_w_oee"], inplace=True, errors="ignore")
-    daily = daily.merge(daily_oee[["date_str", "n_shifts", "avg_oee"]], on="date_str", how="left")
-
-    daily["total_hours"] = daily["total_hours"].round(1)
-    daily["cases_per_hour"] = (daily["total_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
-    daily["target_cph"] = (daily["target_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
-    daily["total_cases"] = daily["total_cases"].round(0)
-    daily["target_cases"] = daily["target_cases"].round(0)
-    daily["cases_vs_target"] = (daily["total_cases"] - daily["target_cases"]).round(0)
-    daily["pct_of_target"] = (daily["total_cases"] / daily["target_cases"].replace(0, np.nan) * 100).fillna(0).round(1)
-    daily = daily.sort_values("date_str")
-    daily["oee_7day_avg"] = daily["avg_oee"].rolling(7, min_periods=1).mean().round(1)
-    daily["cph_7day_avg"] = daily["cases_per_hour"].rolling(7, min_periods=1).mean().round(0)
-    daily_out = daily[["date_str", "n_shifts", "total_hours", "cases_per_hour", "target_cph",
-                       "total_cases", "target_cases", "cases_vs_target", "pct_of_target",
-                       "avg_oee", "oee_7day_avg"]].copy()
-    daily_out.columns = ["Date", "Shifts", "Sched Hours", "Cases/Hr", "Target CPH",
-                         "Actual Cases", "Target Cases", "vs Target", "% of Target",
-                         "OEE %", "OEE 7-Day Avg"]
-    results["Daily Trend"] = daily_out
-
-    # ===================================================================
-    # TAB 11: SHIFT x DAY HEATMAP
-    # ===================================================================
-    pivot = shift_summary.pivot_table(
-        index="date_str", columns="shift", values="oee_pct", aggfunc="first"
-    ).round(1).reset_index()
-    pivot.columns.name = None
-    pivot = pivot.rename(columns={"date_str": "Date"})
-    results["Shift x Day OEE"] = pivot
-
-    # ===================================================================
-    # TAB 12: WHAT TO FOCUS ON (with evidence — show the work)
-    # ===================================================================
     OEE_TARGET = 50.0  # Plant target OEE %
     oee_gap_to_target = OEE_TARGET - avg_oee
     target_cases_per_day = target_cph * (total_hours / n_days)
@@ -1709,205 +1927,335 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
 
     results["What to Focus On"] = pd.DataFrame(recs)
 
-    # ===================================================================
-    # TAB: AI FINDINGS
-    # ===================================================================
-    if has_downtime and downtime.get("findings"):
-        findings_data = []
-        for i, finding in enumerate(downtime["findings"]):
-            findings_data.append({"#": i + 1, "Finding": finding})
-        results["AI Findings"] = pd.DataFrame(findings_data)
-
-    # ===================================================================
-    # TAB: SHIFT REPORT SAMPLES
-    # ===================================================================
-    if has_downtime and downtime.get("shift_samples"):
-        samples = downtime["shift_samples"]
-        report_rows = []
-        for s in samples:
-            if s.get("col_7") or s.get("col_8"):
-                report_rows.append({
-                    "Shift": s.get("col_3", ""),
-                    "Line": s.get("col_4", ""),
-                    "Area/Machine": s.get("col_7", ""),
-                    "Issue": s.get("col_8", ""),
-                    "Action": s.get("col_14", ""),
-                    "Result": s.get("col_15", ""),
-                    "Status": s.get("col_16", ""),
-                    "Time (min)": s.get("col_17", ""),
-                })
-        if report_rows:
-            results["Shift Report Sample"] = pd.DataFrame(report_rows)
-
     return results
 
 
 # ---------------------------------------------------------------------------
 # Excel Writer
 # ---------------------------------------------------------------------------
+def _write_df_table(ws, df, start_row, header_fmt, formats=None):
+    """Write a DataFrame as a table with headers. Returns next available row."""
+    if len(df) == 0:
+        return start_row
+
+    # Headers
+    for col_num, col_name in enumerate(df.columns):
+        ws.write(start_row, col_num, col_name, header_fmt)
+
+    # Data rows
+    for row_num in range(len(df)):
+        for col_num in range(len(df.columns)):
+            ws.write(start_row + 1 + row_num, col_num, df.iloc[row_num, col_num])
+
+    return start_row + 1 + len(df) + 2  # +2 blank rows after table
+
+
+def _write_plant_summary_sheet(workbook, writer, data, formats):
+    """Write the Plant Summary sheet with multiple sections."""
+    ws_name = "Plant Summary"
+    ws = workbook.add_worksheet(ws_name)
+
+    title_fmt = formats["title"]
+    subtitle_fmt = formats["subtitle"]
+    section_fmt = formats["section"]
+    header_fmt = formats["header"]
+    narrative_fmt = formats.get("narrative", subtitle_fmt)
+
+    row = 0
+    ws.write(row, 0, data.get("title", "Plant Summary"), title_fmt)
+    row += 1
+    ws.write(row, 0, data.get("subtitle", ""), subtitle_fmt)
+    row += 2
+
+    # --- KPIs ---
+    ws.write(row, 0, "Plant KPIs", section_fmt)
+    row += 1
+    kpis = data.get("kpis", pd.DataFrame())
+    row = _write_df_table(ws, kpis, row, header_fmt)
+
+    # --- Shift Comparison ---
+    ws.write(row, 0, "Shift Comparison", section_fmt)
+    row += 1
+    comp = data.get("shift_comparison", pd.DataFrame())
+    comp_start = row
+    row = _write_df_table(ws, comp, row, header_fmt)
+    # OEE color scale
+    if "OEE %" in comp.columns and len(comp) > 0:
+        col_idx = list(comp.columns).index("OEE %")
+        ws.conditional_format(comp_start + 1, col_idx, comp_start + len(comp), col_idx, {
+            "type": "3_color_scale",
+            "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
+        })
+
+    # --- Loss Breakdown by Shift ---
+    ws.write(row, 0, "Loss Breakdown by Shift", section_fmt)
+    row += 1
+    loss = data.get("loss_breakdown", pd.DataFrame())
+    row = _write_df_table(ws, loss, row, header_fmt)
+
+    # --- Daily Trend ---
+    ws.write(row, 0, "Daily Trend", section_fmt)
+    row += 1
+    daily = data.get("daily_trend", pd.DataFrame())
+    daily_start = row
+    row = _write_df_table(ws, daily, row, header_fmt)
+    if "OEE %" in daily.columns and len(daily) > 0:
+        col_idx = list(daily.columns).index("OEE %")
+        ws.conditional_format(daily_start + 1, col_idx, daily_start + len(daily), col_idx, {
+            "type": "3_color_scale",
+            "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
+        })
+
+    # Column widths
+    ws.set_column(0, 0, 28)
+    ws.set_column(1, 1, 18)
+    for c in range(2, 10):
+        ws.set_column(c, c, 14)
+
+    return ws_name
+
+
+def _write_shift_sheet(workbook, writer, sheet_name, data, formats):
+    """Write a per-shift sheet with narrative, tables, and charts."""
+    ws = workbook.add_worksheet(sheet_name[:31])
+
+    title_fmt = formats["title"]
+    subtitle_fmt = formats["subtitle"]
+    section_fmt = formats["section"]
+    header_fmt = formats["header"]
+    narrative_fmt = formats["narrative"]
+
+    row = 0
+
+    # --- A. NARRATIVE ---
+    ws.write(row, 0, sheet_name, title_fmt)
+    row += 1
+    ws.write(row, 0, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_fmt)
+    row += 2
+
+    narrative = data.get("narrative", "")
+    if narrative:
+        # Merge A-H for narrative text
+        ws.merge_range(row, 0, row + 6, 7, narrative, narrative_fmt)
+        row += 9
+
+    # --- B. SCORECARD ---
+    ws.write(row, 0, "Scorecard", section_fmt)
+    row += 1
+    scorecard = data.get("scorecard", pd.DataFrame())
+    sc_start = row
+    row = _write_df_table(ws, scorecard, row, header_fmt)
+    if "OEE %" in scorecard.columns and len(scorecard) > 0:
+        col_idx = list(scorecard.columns).index("OEE %")
+        ws.conditional_format(sc_start + 1, col_idx, sc_start + len(scorecard), col_idx, {
+            "type": "3_color_scale",
+            "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
+        })
+
+    # --- C. LOSS BREAKDOWN + PIE CHART ---
+    ws.write(row, 0, "Loss Breakdown", section_fmt)
+    row += 1
+    loss = data.get("loss_breakdown", pd.DataFrame())
+    loss_start = row
+    row = _write_df_table(ws, loss, row, header_fmt)
+
+    # Pie chart: A/P/Q loss split (use last row or aggregate)
+    if len(loss) > 0:
+        # Build summary for pie: total losses across all days
+        raw = data.get("raw", {})
+        avail_l = raw.get("avail_loss", 0)
+        perf_l = raw.get("perf_loss", 0)
+        qual_l = raw.get("qual_loss", 0)
+
+        # Write pie data in a helper block
+        pie_row = row
+        ws.write(pie_row, 0, "Loss Type")
+        ws.write(pie_row, 1, "Loss %")
+        ws.write(pie_row + 1, 0, "Availability")
+        ws.write(pie_row + 1, 1, round(avail_l, 1))
+        ws.write(pie_row + 2, 0, "Performance")
+        ws.write(pie_row + 2, 1, round(perf_l, 1))
+        ws.write(pie_row + 3, 0, "Quality")
+        ws.write(pie_row + 3, 1, round(qual_l, 1))
+
+        chart = workbook.add_chart({"type": "pie"})
+        chart.add_series({
+            "name": "Loss Breakdown",
+            "categories": [sheet_name[:31], pie_row + 1, 0, pie_row + 3, 0],
+            "values": [sheet_name[:31], pie_row + 1, 1, pie_row + 3, 1],
+            "points": [
+                {"fill": {"color": "#E74C3C"}},  # red = availability
+                {"fill": {"color": "#F39C12"}},  # orange = performance
+                {"fill": {"color": "#3498DB"}},  # blue = quality
+            ],
+        })
+        chart.set_title({"name": f"{sheet_name} — Where is OEE Lost?"})
+        chart.set_size({"width": 400, "height": 300})
+        ws.insert_chart(4, pie_row, chart)  # col E
+        row = pie_row + 5
+
+    row += 2
+
+    # --- D. DOWNTIME CAUSES + BAR CHART ---
+    ws.write(row, 0, "Downtime Causes (Top 10)", section_fmt)
+    row += 1
+    causes = data.get("downtime_causes", pd.DataFrame())
+    causes_start = row
+    row = _write_df_table(ws, causes, row, header_fmt)
+
+    if len(causes) > 0 and "Total Min" in causes.columns:
+        n = len(causes)
+        cause_col = list(causes.columns).index("Cause")
+        min_col = list(causes.columns).index("Total Min")
+
+        chart = workbook.add_chart({"type": "bar"})
+        chart.add_series({
+            "name": "Total Minutes",
+            "categories": [sheet_name[:31], causes_start + 1, cause_col,
+                          causes_start + n, cause_col],
+            "values": [sheet_name[:31], causes_start + 1, min_col,
+                       causes_start + n, min_col],
+            "fill": {"color": "#1B2A4A"},
+        })
+        chart.set_title({"name": f"{sheet_name} — Top Downtime Causes"})
+        chart.set_y_axis({"reverse": True})
+        chart.set_size({"width": 500, "height": 350})
+        chart.set_legend({"none": True})
+        ws.insert_chart(4, row, chart)  # col E
+        row += 2
+
+    row += 2
+
+    # --- E. HOUR-BY-HOUR ---
+    ws.write(row, 0, "Hour-by-Hour Detail", section_fmt)
+    row += 1
+    hbh = data.get("hour_by_hour", pd.DataFrame())
+    hbh_start = row
+    row = _write_df_table(ws, hbh, row, header_fmt)
+    if "OEE %" in hbh.columns and len(hbh) > 0:
+        col_idx = list(hbh.columns).index("OEE %")
+        ws.conditional_format(hbh_start + 1, col_idx, hbh_start + len(hbh), col_idx, {
+            "type": "3_color_scale",
+            "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
+        })
+
+    # --- F. DEAD HOURS ---
+    dead = data.get("dead_hours", pd.DataFrame())
+    if len(dead) > 0:
+        ws.write(row, 0, "Dead Hours", section_fmt)
+        row += 1
+        row = _write_df_table(ws, dead, row, header_fmt)
+
+    # --- G. WORST HOURS ---
+    worst = data.get("worst_hours", pd.DataFrame())
+    if len(worst) > 0:
+        ws.write(row, 0, "Worst Hours (Top 10)", section_fmt)
+        row += 1
+        wh_start = row
+        row = _write_df_table(ws, worst, row, header_fmt)
+        if "OEE %" in worst.columns and len(worst) > 0:
+            col_idx = list(worst.columns).index("OEE %")
+            ws.conditional_format(wh_start + 1, col_idx, wh_start + len(worst), col_idx, {
+                "type": "3_color_scale",
+                "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
+            })
+
+    # Column widths
+    ws.set_column(0, 0, 16)   # Date / labels
+    ws.set_column(1, 1, 14)   # secondary
+    ws.set_column(2, 2, 14)
+    ws.set_column(3, 3, 14)
+    ws.set_column(4, 4, 14)
+    ws.set_column(5, 5, 14)
+    ws.set_column(6, 6, 50)   # What Happened / Cause
+    ws.set_column(7, 7, 30)   # Product
+
+    return sheet_name[:31]
+
+
 def write_excel(results, output_path):
+    """Write analysis results to Excel. Handles both dict-based (shift sheets,
+    Plant Summary) and DataFrame-based (What to Focus On) entries."""
     print(f"Writing: {output_path}")
 
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
         workbook = writer.book
 
-        header_fmt = workbook.add_format({
-            "bold": True, "bg_color": "#1B2A4A", "font_color": "white",
-            "border": 1, "text_wrap": True, "valign": "vcenter", "font_size": 11
-        })
-        title_fmt = workbook.add_format({"bold": True, "font_size": 14, "font_color": "#1B2A4A"})
-        subtitle_fmt = workbook.add_format({"italic": True, "font_size": 10, "font_color": "#666666"})
-        section_fmt = workbook.add_format({
-            "bold": True, "font_size": 11, "font_color": "#1B2A4A",
-            "bottom": 2, "bottom_color": "#1B2A4A"
-        })
+        formats = {
+            "header": workbook.add_format({
+                "bold": True, "bg_color": "#1B2A4A", "font_color": "white",
+                "border": 1, "text_wrap": True, "valign": "vcenter", "font_size": 11
+            }),
+            "title": workbook.add_format({"bold": True, "font_size": 14, "font_color": "#1B2A4A"}),
+            "subtitle": workbook.add_format({"italic": True, "font_size": 10, "font_color": "#666666"}),
+            "section": workbook.add_format({
+                "bold": True, "font_size": 11, "font_color": "#1B2A4A",
+                "bottom": 2, "bottom_color": "#1B2A4A"
+            }),
+            "narrative": workbook.add_format({
+                "text_wrap": True, "valign": "top", "font_size": 10,
+                "font_color": "#333333",
+            }),
+        }
 
-        # Tab order: story flow
+        # Sheet order: Plant Summary, shifts (1st, 2nd, 3rd), What to Focus On
         sheet_order = [
-            "Executive Summary",
-            # Shift deep dives will be inserted dynamically
-            "Shift Comparison", "Loss Breakdown", "Dead Hours",
-            "Shift Downtime",
-            "Downtime Pareto", "Fault Summary", "Fault Detail",
-            "Worst Hours", "Daily Trend", "Shift x Day OEE",
+            "Plant Summary",
+            "1st Shift", "2nd Shift", "3rd Shift",
             "What to Focus On",
-            "AI Findings", "Shift Report Sample",
         ]
 
-        # Insert shift deep dive tabs after Executive Summary
-        dive_tabs = [k for k in results if "Deep Dive" in k]
-        final_order = ["Executive Summary"] + dive_tabs + [s for s in sheet_order if s != "Executive Summary"]
+        first_ws_name = None
 
-        for sheet_name in final_order:
+        for sheet_name in sheet_order:
             if sheet_name not in results:
                 continue
 
-            df = results[sheet_name]
-            safe_name = sheet_name[:31]
-            df.to_excel(writer, sheet_name=safe_name, startrow=2, index=False)
-            ws = writer.sheets[safe_name]
+            data = results[sheet_name]
 
-            ws.write(0, 0, sheet_name, title_fmt)
-            ws.write(1, 0, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_fmt)
+            if sheet_name == "Plant Summary" and isinstance(data, dict):
+                ws_name = _write_plant_summary_sheet(workbook, writer, data, formats)
+                if first_ws_name is None:
+                    first_ws_name = ws_name
 
-            for col_num, col_name in enumerate(df.columns):
-                ws.write(2, col_num, col_name, header_fmt)
+            elif isinstance(data, dict) and "narrative" in data:
+                # Per-shift sheet
+                ws_name = _write_shift_sheet(workbook, writer, sheet_name, data, formats)
+                if first_ws_name is None:
+                    first_ws_name = ws_name
 
-            # Auto-width
-            for col_num, col_name in enumerate(df.columns):
-                max_len = max(
-                    df[col_name].astype(str).map(len).max() if len(df) > 0 else 0,
-                    len(str(col_name))
-                )
-                ws.set_column(col_num, col_num, min(max_len + 4, 60))
+            elif isinstance(data, pd.DataFrame):
+                # DataFrame sheet (What to Focus On)
+                safe_name = sheet_name[:31]
+                data.to_excel(writer, sheet_name=safe_name, startrow=2, index=False)
+                ws = writer.sheets[safe_name]
 
-            # OEE color scales
-            for oee_label in ["OEE %", "Avg OEE %", "OEE 7-Day Avg"]:
-                if oee_label in df.columns:
-                    col_idx = list(df.columns).index(oee_label)
-                    ws.conditional_format(3, col_idx, 3 + len(df), col_idx, {
-                        "type": "3_color_scale",
-                        "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
-                    })
+                ws.write(0, 0, sheet_name, formats["title"])
+                ws.write(1, 0, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}", formats["subtitle"])
 
-            # Downtime Pareto color scales
-            if sheet_name == "Downtime Pareto" and "Total Minutes" in df.columns:
-                col_idx = list(df.columns).index("Total Minutes")
-                ws.conditional_format(3, col_idx, 3 + len(df), col_idx, {
-                    "type": "3_color_scale",
-                    "min_color": "#63BE7B", "mid_color": "#FFEB84", "max_color": "#F8696B",
-                })
+                for col_num, col_name in enumerate(data.columns):
+                    ws.write(2, col_num, col_name, formats["header"])
 
-            # Shift Deep Dive formatting
-            if "Deep Dive" in sheet_name:
-                ws.set_column(0, 0, 25)  # Section
-                ws.set_column(1, 1, 35)  # Metric
-                ws.set_column(2, 2, 18)  # Value
-                ws.set_column(3, 3, 70)  # Detail
+                # Auto-width
+                for col_num, col_name in enumerate(data.columns):
+                    max_len = max(
+                        data[col_name].astype(str).map(len).max() if len(data) > 0 else 0,
+                        len(str(col_name))
+                    )
+                    ws.set_column(col_num, col_num, min(max_len + 4, 60))
 
-                # Bold section headers
-                for row_num in range(len(df)):
-                    val = df.iloc[row_num].get("Section", "")
-                    if val and str(val).strip():
-                        ws.write(row_num + 3, 0, val, section_fmt)
+                # What to Focus On specific formatting
+                if sheet_name == "What to Focus On":
+                    ws.set_column(1, 1, 70)   # Finding
+                    ws.set_column(2, 2, 100)  # The Work (evidence)
+                    ws.set_column(3, 7, 58)   # Steps 1-5
 
-            # What to Focus On
-            if sheet_name == "What to Focus On":
-                ws.set_column(1, 1, 70)  # Finding
-                ws.set_column(2, 2, 100) # The Work (evidence)
-                ws.set_column(3, 7, 58)  # Steps 1-5
+                if first_ws_name is None:
+                    first_ws_name = safe_name
 
-            # Fault Summary
-            if sheet_name == "Fault Summary":
-                ws.set_column(0, 0, 28)  # Category
-                ws.set_column(6, 6, 55)  # Who owns this
-                if "% of All Downtime" in df.columns:
-                    col_idx = list(df.columns).index("% of All Downtime")
-                    ws.conditional_format(3, col_idx, 3 + len(df), col_idx, {
-                        "type": "3_color_scale",
-                        "min_color": "#63BE7B", "mid_color": "#FFEB84", "max_color": "#F8696B",
-                    })
-
-            # Fault Detail
-            if sheet_name == "Fault Detail":
-                ws.set_column(0, 0, 28)
-                ws.set_column(1, 1, 30)
-
-            # AI Findings
-            if sheet_name == "AI Findings":
-                ws.set_column(1, 1, 100)
-
-            # Shift Report Sample
-            if sheet_name == "Shift Report Sample":
-                ws.set_column(3, 3, 55)
-                ws.set_column(4, 4, 40)
-                ws.set_column(5, 5, 35)
-
-            # Dead Hours
-            if sheet_name == "Dead Hours":
-                ws.set_column(0, 0, 18)   # Date
-                ws.set_column(1, 1, 40)   # Shift / summary text
-                ws.set_column(2, 2, 16)   # Hours
-                ws.set_column(3, 3, 12)   # Duration
-                ws.set_column(4, 4, 14)   # Pattern
-                if "Cause (Machine Data)" in df.columns:
-                    cause_col = list(df.columns).index("Cause (Machine Data)")
-                    ws.set_column(cause_col, cause_col, 65)
-                # Bold section headers (SUMMARY, SHIFT COMPARISON)
-                for row_num in range(len(df)):
-                    val = str(df.iloc[row_num].get("Date", ""))
-                    if val in ("SUMMARY", "SHIFT COMPARISON"):
-                        ws.write(row_num + 3, 0, val, section_fmt)
-
-            # Worst Hours — What Happened column
-            if sheet_name == "Worst Hours":
-                if "What Happened" in df.columns:
-                    wh_col = list(df.columns).index("What Happened")
-                    ws.set_column(wh_col, wh_col, 80)
-
-            # Shift Downtime
-            if sheet_name == "Shift Downtime":
-                ws.set_column(0, 0, 14)   # Date
-                ws.set_column(1, 1, 18)   # Shift
-                ws.set_column(2, 2, 35)   # Cause
-                if "Total Min" in df.columns:
-                    col_idx = list(df.columns).index("Total Min")
-                    ws.conditional_format(3, col_idx, 3 + len(df), col_idx, {
-                        "type": "3_color_scale",
-                        "min_color": "#63BE7B", "mid_color": "#FFEB84", "max_color": "#F8696B",
-                    })
-
-            # Shift x Day heatmap
-            if sheet_name == "Shift x Day OEE":
-                for col_num in range(1, len(df.columns)):
-                    ws.conditional_format(3, col_num, 3 + len(df), col_num, {
-                        "type": "3_color_scale",
-                        "min_color": "#F8696B", "mid_color": "#FFEB84", "max_color": "#63BE7B",
-                    })
-
-        # Activate Executive Summary as landing page
-        if "Executive Summary" in results:
-            writer.sheets["Executive Summary"].activate()
+        # Activate Plant Summary as landing page
+        if first_ws_name and first_ws_name in writer.sheets:
+            writer.sheets[first_ws_name].activate()
 
     print(f"Done! Open: {output_path}")
 
@@ -1965,120 +2313,61 @@ def main():
         else:
             print(f"Warning: Downtime file not found: {downtime_file}")
 
-    # Split into one day at a time
-    dates = sorted(hourly["date_str"].unique())
+    # Single file per analysis run (days shown within each shift sheet, not split)
     basename = os.path.splitext(os.path.basename(oee_file))[0]
     output_dir = os.path.dirname(oee_file)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     suffix = "_FULL_ANALYSIS" if downtime else "_ANALYSIS"
 
-    for date_str in dates:
-        print(f"\n{'='*60}")
-        print(f"  Analyzing: {date_str}")
-        print(f"{'='*60}")
+    n_days = hourly["date_str"].nunique()
+    dates = sorted(hourly["date_str"].unique())
+    print(f"\n{'='*60}")
+    print(f"  Analyzing: {', '.join(dates)} ({n_days} day(s))")
+    print(f"{'='*60}")
 
-        # Filter OEE data to this date
-        day_hourly = hourly[hourly["date_str"] == date_str].copy().reset_index(drop=True)
-        day_shift_summary = shift_summary[shift_summary["date_str"] == date_str].copy().reset_index(drop=True)
+    results = analyze(hourly, shift_summary, overall, hour_avg, downtime)
 
-        # Rebuild overall (per-shift aggregates) for this day only
-        day_overall = (
-            day_shift_summary.groupby("shift")
-            .agg({c: "sum" if c in ["total_cases", "total_hours", "good_cases", "bad_cases"] else "first"
-                  for c in day_shift_summary.columns if c != "shift"})
-            .reset_index()
-        )
-        if "oee_pct" in day_overall.columns and "total_hours" in day_overall.columns:
-            for _, row in day_overall.iterrows():
-                s_data = day_hourly[day_hourly["shift"] == row["shift"]]
-                if len(s_data) > 0:
-                    sa, sp, sq, soee = _aggregate_oee(s_data)
-                    day_overall.loc[day_overall["shift"] == row["shift"], "oee_pct"] = soee
-                    day_overall.loc[day_overall["shift"] == row["shift"], "cases_per_hour"] = (
-                        s_data["total_cases"].sum() / s_data["total_hours"].sum()
-                        if s_data["total_hours"].sum() > 0 else 0
-                    )
+    output_path = os.path.join(output_dir, f"{basename}{suffix}_{timestamp}.xlsx")
+    write_excel(results, output_path)
 
-        # Use full hour_avg (shift-hour averages don't change by date)
-        day_hour_avg = hour_avg
-
-        # Filter downtime events to this date
-        day_downtime = None
-        if downtime is not None:
-            day_downtime = dict(downtime)  # shallow copy
-            if "events_df" in downtime and downtime["events_df"] is not None and len(downtime["events_df"]) > 0:
-                edf = downtime["events_df"]
-                day_events = edf[edf["start_time"].dt.strftime("%Y-%m-%d") == date_str].copy()
-                day_downtime["events_df"] = day_events.reset_index(drop=True)
-                # Rebuild shift_reasons_df for this day
-                if len(day_events) > 0:
-                    sr = day_events.groupby(["shift", "reason"]).agg(
-                        count=("duration_minutes", "size"),
-                        total_minutes=("duration_minutes", "sum")
-                    ).reset_index()
-                    day_downtime["shift_reasons_df"] = sr
-                else:
-                    day_downtime["shift_reasons_df"] = pd.DataFrame()
-            # Filter reasons_df to this day's events if available
-            if "events_df" in day_downtime and len(day_downtime.get("events_df", [])) > 0:
-                day_ev = day_downtime["events_df"]
-                day_reasons = day_ev.groupby("reason").agg(
-                    total_minutes=("duration_minutes", "sum"),
-                    total_occurrences=("duration_minutes", "size")
-                ).reset_index()
-                day_reasons["total_hours"] = day_reasons["total_minutes"] / 60
-                day_downtime["reasons_df"] = day_reasons
-
-        results = analyze(day_hourly, day_shift_summary, day_overall, day_hour_avg, day_downtime)
-
-        date_label = date_str.replace("-", "")
-        output_path = os.path.join(output_dir, f"{basename}_{date_label}{suffix}_{timestamp}.xlsx")
-        write_excel(results, output_path)
-
-        # Console summary
-        _print_summary(results, output_path)
+    # Console summary
+    _print_summary(results, output_path)
 
 
 def _print_summary(results, output_path):
-    """Print console summary for one day's analysis."""
+    """Print console summary for the analysis."""
     print("\n" + "=" * 60)
     print("QUICK SUMMARY")
     print("=" * 60)
-    exec_df = results["Executive Summary"]
-    for _, row in exec_df.iterrows():
-        if row["Metric"]:
-            print(f"  {row['Metric']}: {row['Value']}")
 
-    # Shift deep dives
-    for key in results:
-        if "Deep Dive" in key:
-            dd = results[key]
-            scorecard = dd[dd["Section"] == "SHIFT SCORECARD"]
-            if len(scorecard) > 0:
-                print(f"\n  --- {key.upper()} ---")
-                detail_rows = dd[(dd["Section"] == "") & (dd["Metric"] != "")].head(7)
-                for _, r in detail_rows.iterrows():
-                    print(f"    {r['Metric']}: {r['Value']}  {r['Detail']}")
+    # Plant Summary KPIs
+    plant = results.get("Plant Summary", {})
+    if isinstance(plant, dict):
+        kpis = plant.get("kpis", pd.DataFrame())
+        if len(kpis) > 0:
+            for _, row in kpis.iterrows():
+                print(f"  {row['Metric']}: {row['Value']}")
 
-    # Fault summary
-    if "Fault Summary" in results:
-        print("\n  --- FAULT CLASSIFICATION ---")
-        for _, row in results["Fault Summary"].iterrows():
-            print(f"    {row['Fault Category']}: {row['Total Hours']:.0f} hrs ({row['% of All Downtime']}%) -> {row['Who Owns This']}")
+    # Per-shift summary
+    for shift_name in ["1st Shift", "2nd Shift", "3rd Shift"]:
+        if shift_name in results and isinstance(results[shift_name], dict):
+            raw = results[shift_name].get("raw", {})
+            print(f"\n  --- {shift_name.upper()} ---")
+            print(f"    OEE: {raw.get('oee', 0):.1f}%")
+            print(f"    Cases: {raw.get('cases', 0):,.0f}")
+            print(f"    CPH: {raw.get('cph', 0):,.0f} (target: {raw.get('target_cph', 0):,.0f})")
+            print(f"    Primary loss: {raw.get('primary_loss', 'N/A')}")
 
-    print("\nTOP ACTIONS:")
-    focus_df = results["What to Focus On"]
-    for _, row in focus_df.head(5).iterrows():
-        print(f"\n  #{row['Priority']}: {row['Finding']}")
-        print(f"     Step 1: {row['Step 1']}")
+    # Top actions
+    if "What to Focus On" in results:
+        print("\nTOP ACTIONS:")
+        focus_df = results["What to Focus On"]
+        for _, row in focus_df.head(5).iterrows():
+            print(f"\n  #{row['Priority']}: {row['Finding']}")
+            print(f"     Step 1: {row['Step 1']}")
 
-    if "Downtime Pareto" in results:
-        print("\nDOWNTIME PARETO (top 5):")
-        pareto = results["Downtime Pareto"].head(5)
-        for _, row in pareto.iterrows():
-            print(f"  {row['Cause']} [{row['Fault Type']}]: {row['Total Minutes']:,.0f} min / {int(row['Events'])} events ({row['% of Total']}%)")
-
-    print(f"\nFull analysis: {output_path}")
+    print(f"\nSheets: {', '.join(results.keys())}")
+    print(f"Full analysis: {output_path}")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from analyze import load_oee_data, load_downtime_data, analyze, write_excel, _aggregate_oee
+from analyze import load_oee_data, load_downtime_data, analyze, write_excel
 from parse_traksys import parse_oee_period_detail, parse_event_summary, detect_file_type
 from oee_history import save_run, load_trends
 from third_shift_report import (
@@ -109,109 +109,61 @@ with tab_analyze:
                         except Exception as e:
                             st.warning(f"Could not load downtime data: {e}")
 
-                    # Split into one day at a time
+                    # Single file per analysis run
                     dates = sorted(hourly["date_str"].unique())
                     basename = os.path.splitext(oee_file.name)[0]
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
                     suffix = "_FULL_ANALYSIS" if downtime else "_ANALYSIS"
 
-                    st.success(f"Found {len(dates)} day(s) to analyze: {', '.join(dates)}")
+                    st.success(f"Analyzing {len(dates)} day(s): {', '.join(dates)}")
 
-                    for date_str in dates:
-                        # Filter OEE data to this date
-                        day_hourly = hourly[hourly["date_str"] == date_str].copy().reset_index(drop=True)
-                        day_shift_summary = shift_summary[shift_summary["date_str"] == date_str].copy().reset_index(drop=True)
+                    results = analyze(hourly, shift_summary, overall, hour_avg, downtime)
 
-                        # Rebuild overall for this day
-                        day_overall = (
-                            day_shift_summary.groupby("shift")
-                            .agg({c: "sum" if c in ["total_cases", "total_hours", "good_cases", "bad_cases"] else "first"
-                                  for c in day_shift_summary.columns if c != "shift"})
-                            .reset_index()
-                        )
-                        if "oee_pct" in day_overall.columns:
-                            for _, row in day_overall.iterrows():
-                                s_data = day_hourly[day_hourly["shift"] == row["shift"]]
-                                if len(s_data) > 0:
-                                    sa, sp, sq, soee = _aggregate_oee(s_data)
-                                    day_overall.loc[day_overall["shift"] == row["shift"], "oee_pct"] = soee
-                                    day_overall.loc[day_overall["shift"] == row["shift"], "cases_per_hour"] = (
-                                        s_data["total_cases"].sum() / s_data["total_hours"].sum()
-                                        if s_data["total_hours"].sum() > 0 else 0
-                                    )
+                    output_name = f"{basename}{suffix}_{timestamp}.xlsx"
+                    output_path = os.path.join(tmp_dir, output_name)
+                    write_excel(results, output_path)
 
-                        # Filter downtime events to this date
-                        day_downtime = None
-                        if downtime is not None:
-                            day_downtime = dict(downtime)
-                            if "events_df" in downtime and downtime["events_df"] is not None and len(downtime["events_df"]) > 0:
-                                edf = downtime["events_df"]
-                                day_events = edf[edf["start_time"].dt.strftime("%Y-%m-%d") == date_str].copy()
-                                day_downtime["events_df"] = day_events.reset_index(drop=True)
-                                if len(day_events) > 0:
-                                    sr = day_events.groupby(["shift", "reason"]).agg(
-                                        count=("duration_minutes", "size"),
-                                        total_minutes=("duration_minutes", "sum")
-                                    ).reset_index()
-                                    day_downtime["shift_reasons_df"] = sr
-                                else:
-                                    day_downtime["shift_reasons_df"] = pd.DataFrame()
-                            if "events_df" in day_downtime and len(day_downtime.get("events_df", [])) > 0:
-                                day_ev = day_downtime["events_df"]
-                                day_reasons = day_ev.groupby("reason").agg(
-                                    total_minutes=("duration_minutes", "sum"),
-                                    total_occurrences=("duration_minutes", "size")
-                                ).reset_index()
-                                day_reasons["total_hours"] = day_reasons["total_minutes"] / 60
-                                day_downtime["reasons_df"] = day_reasons
+                    # Save to history
+                    try:
+                        save_run(results, hourly, shift_summary, overall, downtime)
+                    except Exception:
+                        pass
 
-                        results = analyze(day_hourly, day_shift_summary, day_overall, hour_avg, day_downtime)
+                    with open(output_path, "rb") as f:
+                        output_bytes = f.read()
 
-                        date_label = date_str.replace("-", "")
-                        output_name = f"{basename}_{date_label}{suffix}_{timestamp}.xlsx"
-                        output_path = os.path.join(tmp_dir, output_name)
-                        write_excel(results, output_path)
+                    st.download_button(
+                        label=f"Download {output_name}",
+                        data=output_bytes,
+                        file_name=output_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
 
-                        # Save to history
-                        try:
-                            save_run(results, day_hourly, day_shift_summary, day_overall, day_downtime)
-                        except Exception:
-                            pass
+                    # Quick summary metrics from Plant Summary KPIs
+                    plant_data = results.get("Plant Summary")
+                    if isinstance(plant_data, dict):
+                        kpis = plant_data.get("kpis", pd.DataFrame())
+                        if len(kpis) > 0:
+                            mcols = st.columns(min(4, len(kpis)))
+                            for i, (_, row) in enumerate(kpis.head(4).iterrows()):
+                                mcols[i].metric(str(row["Metric"]), str(row["Value"]))
 
-                        with open(output_path, "rb") as f:
-                            output_bytes = f.read()
+                    # Per-shift narrative in expandable sections
+                    for shift_name in ["1st Shift", "2nd Shift", "3rd Shift"]:
+                        shift_data = results.get(shift_name)
+                        if isinstance(shift_data, dict):
+                            raw = shift_data.get("raw", {})
+                            with st.expander(f"{shift_name} — {raw.get('oee', 0):.1f}% OEE"):
+                                st.markdown(shift_data.get("narrative", ""))
 
-                        # --- Per-day output ---
-                        st.markdown("---")
-                        st.subheader(f"{date_str}")
+                    # Top 3 actions
+                    focus_df = results.get("What to Focus On")
+                    if focus_df is not None:
+                        for _, row in focus_df.head(3).iterrows():
+                            st.markdown(f"**#{row['Priority']}:** {row['Finding']}")
 
-                        st.download_button(
-                            label=f"Download {output_name}",
-                            data=output_bytes,
-                            file_name=output_name,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            key=f"download_{date_str}",
-                        )
-
-                        # Quick summary metrics
-                        exec_df = results.get("Executive Summary")
-                        if exec_df is not None:
-                            metrics = exec_df[exec_df["Metric"].astype(str).str.strip() != ""]
-                            key_metrics = ["Average OEE", "Target Cases (Plant Std)", "Cases vs Target", "% of Target"]
-                            found = metrics[metrics["Metric"].isin(key_metrics)]
-                            if len(found) > 0:
-                                mcols = st.columns(len(found))
-                                for i, (_, row) in enumerate(found.iterrows()):
-                                    mcols[i].metric(str(row["Metric"]), str(row["Value"]))
-
-                        # Top 3 actions
-                        focus_df = results.get("What to Focus On")
-                        if focus_df is not None:
-                            for _, row in focus_df.head(3).iterrows():
-                                st.markdown(f"**#{row['Priority']}:** {row['Finding']}")
-
-                        st.caption(f"Sheets: {', '.join(results.keys())}")
+                    st.caption(f"Sheets: {', '.join(results.keys())}")
 
                 except ValueError as e:
                     err_msg = str(e)

@@ -40,10 +40,25 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
     total_hours = float(hourly["total_hours"].sum())
     avg_cph = total_cases / total_hours if total_hours > 0 else 0.0
 
-    exec_df = results.get("Executive Summary")
+    # Extract KPIs from Plant Summary (new shift-centric structure)
+    # or fall back to Executive Summary (legacy structure)
     avg_oee = avg_avail = avg_perf = avg_qual = 0.0
     cases_lost = 0.0
-    if exec_df is not None:
+    utilization = 0.0
+
+    plant_data = results.get("Plant Summary")
+    exec_df = results.get("Executive Summary")  # legacy fallback
+    if isinstance(plant_data, dict):
+        kpis = plant_data.get("kpis", pd.DataFrame())
+        if len(kpis) > 0:
+            lookup = dict(zip(kpis["Metric"].astype(str).str.strip(), kpis["Value"]))
+            avg_oee = _parse_pct(lookup.get("Overall OEE", "0"))
+            avg_avail = _parse_pct(lookup.get("Average Availability", "0"))
+            avg_perf = _parse_pct(lookup.get("Average Performance", "0"))
+            avg_qual = _parse_pct(lookup.get("Average Quality", "0"))
+            cases_lost = _parse_num(lookup.get("Est. Cases Lost vs Benchmark", "0"))
+            utilization = _parse_pct(lookup.get("Utilization", "0"))
+    elif exec_df is not None:
         lookup = dict(zip(exec_df["Metric"].astype(str).str.strip(), exec_df["Value"]))
         avg_oee = _parse_pct(lookup.get("Average OEE", "0"))
         avg_avail = _parse_pct(lookup.get("Average Availability", "0"))
@@ -52,30 +67,65 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
         cases_lost = _parse_num(lookup.get("Est. Cases Lost vs Benchmark", "0"))
         utilization = _parse_pct(lookup.get("Utilization (% Time Producing)", "0"))
 
+    # Extract per-shift data from new structure or fall back to overall DataFrame
     shifts = []
-    loss_df = results.get("Loss Breakdown")
-    for _, row in overall.iterrows():
-        shift_rec = {
-            "shift": str(row["shift"]),
-            "oee_pct": round(float(row["oee_pct"]), 1),
-            "cases_per_hour": round(float(row.get("cases_per_hour", 0)), 0),
-            "total_cases": round(float(row.get("total_cases", 0)), 0),
-        }
-        if loss_df is not None:
-            match = loss_df[loss_df["Shift"] == row["shift"]]
-            if len(match) > 0:
-                shift_rec["primary_loss"] = str(match.iloc[0].get("Primary Loss Driver", ""))
-        shifts.append(shift_rec)
+    for shift_label in ["1st Shift", "2nd Shift", "3rd Shift"]:
+        shift_data = results.get(shift_label)
+        if isinstance(shift_data, dict):
+            raw = shift_data.get("raw", {})
+            shift_rec = {
+                "shift": raw.get("shift_name", shift_label),
+                "oee_pct": round(float(raw.get("oee", 0)), 1),
+                "cases_per_hour": round(float(raw.get("cph", 0)), 0),
+                "total_cases": round(float(raw.get("total_cases", 0)), 0),
+                "primary_loss": str(raw.get("primary_loss", "")),
+            }
+            shifts.append(shift_rec)
 
+    if not shifts:
+        # Legacy fallback: read from overall DataFrame
+        loss_df = results.get("Loss Breakdown")
+        for _, row in overall.iterrows():
+            shift_rec = {
+                "shift": str(row["shift"]),
+                "oee_pct": round(float(row["oee_pct"]), 1),
+                "cases_per_hour": round(float(row.get("cases_per_hour", 0)), 0),
+                "total_cases": round(float(row.get("total_cases", 0)), 0),
+            }
+            if loss_df is not None:
+                match = loss_df[loss_df["Shift"] == row["shift"]]
+                if len(match) > 0:
+                    shift_rec["primary_loss"] = str(match.iloc[0].get("Primary Loss Driver", ""))
+            shifts.append(shift_rec)
+
+    # Extract top downtime causes from shift data or legacy Pareto
     top_downtime = []
-    pareto_df = results.get("Downtime Pareto")
-    if pareto_df is not None and len(pareto_df) > 0:
-        for _, row in pareto_df.head(5).iterrows():
-            top_downtime.append({
-                "cause": str(row["Cause"]),
-                "minutes": round(float(row["Total Minutes"]), 0),
-                "pct_of_total": round(float(row["% of Total"]), 1),
-            })
+    for shift_label in ["1st Shift", "2nd Shift", "3rd Shift"]:
+        shift_data = results.get(shift_label)
+        if isinstance(shift_data, dict):
+            dt_df = shift_data.get("downtime_causes", pd.DataFrame())
+            if len(dt_df) > 0:
+                for _, row in dt_df.head(3).iterrows():
+                    cause_name = str(row.get("Cause", row.get("cause", "")))
+                    minutes = float(row.get("Total Min", row.get("total_min", 0)))
+                    pct = float(row.get("% of Shift", row.get("pct_of_shift", 0)))
+                    if cause_name and cause_name not in {d["cause"] for d in top_downtime}:
+                        top_downtime.append({
+                            "cause": cause_name,
+                            "minutes": round(minutes, 0),
+                            "pct_of_total": round(pct, 1),
+                        })
+    top_downtime = sorted(top_downtime, key=lambda x: x["minutes"], reverse=True)[:5]
+
+    if not top_downtime:
+        pareto_df = results.get("Downtime Pareto")  # legacy fallback
+        if pareto_df is not None and len(pareto_df) > 0:
+            for _, row in pareto_df.head(5).iterrows():
+                top_downtime.append({
+                    "cause": str(row["Cause"]),
+                    "minutes": round(float(row["Total Minutes"]), 0),
+                    "pct_of_total": round(float(row["% of Total"]), 1),
+                })
 
     record = {
         "run_id": datetime.now().isoformat(),

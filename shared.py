@@ -152,3 +152,71 @@ PRODUCT_TARGET = {
 }
 
 IS_TRAYED = {k for k, v in PRODUCT_PACK.items() if v == "Trayed"}
+
+
+# ---------------------------------------------------------------------------
+# Plant production targets — cases per 8-hour shift by line and product
+# Source: Del Monte Rochelle plant standards
+# ---------------------------------------------------------------------------
+PLANT_TARGETS = {
+    "Line 1": {"6-Trayed": 4000, "6-Shrink": 3500, "6-Shrink/28oz": 3500},
+    "Line 2": {"6 Pack": 7800, "8 Pack": 30000, "12 Pack": 25000},
+    "Line 3": {"12 Pack": 11600, "24 Pack": 6000},
+    "Line 4": {"6/4 Pack": 4800, "6 Pack": 4500, "12 Pack": 7800, "24 Pack": 3000},
+    "Line 5": {"12 Pack": 7800, "24 Pack": 3000},
+}
+
+# Cases per pallet and pieces per case (reference)
+PALLET_AND_PIECE = {
+    "Line 1": {"6-Trayed": (56, 6), "6-Shrink": (56, 6), "6-Shrink/28oz": (200, 6)},
+    "Line 2": {"6 Pack": (102, 6), "8 Pack": (240, 8), "12 Pack": (176, 12)},
+    "Line 3": {"12 Pack": (204, 12), "24 Pack": (102, 24)},
+    "Line 4": {"6/4 Pack": (77, 24), "6 Pack": (102, 6), "12 Pack": (204, 12), "24 Pack": (102, 24)},
+    "Line 5": {"12 Pack": (204, 12), "24 Pack": (102, 24)},
+}
+
+# Map product_code from Traksys OEE Period Detail to pack size label
+_PRODUCT_CODE_TO_PACK = {
+    "6PK": "6 Pack", "6pk": "6 Pack", "6-TRAYED": "6-Trayed", "6-SHRINK": "6-Shrink",
+    "8PK": "8 Pack", "8pk": "8 Pack",
+    "12PK": "12 Pack", "12pk": "12 Pack",
+    "24PK": "24 Pack", "24pk": "24 Pack",
+    "6/4PK": "6/4 Pack", "6/4pk": "6/4 Pack",
+}
+
+# Also map normalized product family names to pack sizes
+_FAMILY_TO_PACK = {
+    "Cut Green Beans 8pk": "8 Pack", "WK Gold Corn 8pk": "8 Pack",
+    "Sweet Peas 8pk": "8 Pack", "Mexican Style Corn": "8 Pack",
+    "Cut Green Beans 12pk": "12 Pack", "WK Corn 12pk": "12 Pack",
+    "Sliced Peaches (trayed)": "6/4 Pack", "Pears (trayed)": "6/4 Pack",
+    "WK Corn (trayed)": "6/4 Pack",
+}
+
+
+def get_target_cph(product_code, line="Line 2"):
+    """Get target cases per hour for a product on a given line.
+
+    Accepts raw Traksys product_code (e.g. '8PK') or normalized family name.
+    Returns target CPH (shift target / 8) or None if unknown.
+    """
+    if not product_code or pd.isna(product_code):
+        return None
+    code = str(product_code).strip()
+
+    # Try direct product_code → pack mapping
+    pack = _PRODUCT_CODE_TO_PACK.get(code) or _PRODUCT_CODE_TO_PACK.get(code.upper())
+    # Try normalized family name → pack mapping
+    if not pack:
+        pack = _FAMILY_TO_PACK.get(code)
+    # Try extracting digits + "pk" pattern
+    if not pack:
+        import re
+        m = re.search(r'(\d+)\s*(?:pk|pack)', code, re.IGNORECASE)
+        if m:
+            n = m.group(1)
+            pack = _PRODUCT_CODE_TO_PACK.get(f"{n}PK")
+
+    if pack and line in PLANT_TARGETS and pack in PLANT_TARGETS[line]:
+        return PLANT_TARGETS[line][pack] / 8.0  # 8-hour shift → CPH
+    return None

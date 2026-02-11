@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
-from shared import EXCLUDE_REASONS, EQUIPMENT_KEYWORDS, classify_fault
+from shared import EXCLUDE_REASONS, EQUIPMENT_KEYWORDS, classify_fault, get_target_cph
 
 # ---------------------------------------------------------------------------
 # Config
@@ -952,9 +952,23 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     avg_avail, avg_perf, avg_qual, avg_oee = _aggregate_oee(hourly)
 
     good_hours = hourly[hourly["total_hours"] >= 0.5]
-    target_cph = good_hours["cases_per_hour"].quantile(0.90)
+    benchmark_cph = good_hours["cases_per_hour"].quantile(0.90)
+    target_cph = benchmark_cph  # fallback for non-product-aware paths
 
-    hourly["cases_gap"] = (target_cph - hourly["cases_per_hour"]).clip(lower=0) * hourly["total_hours"]
+    # Product-aware target: use plant standards when product is known
+    if "product_code" in hourly.columns:
+        hourly["_prod_target_cph"] = hourly["product_code"].apply(get_target_cph)
+        hourly["_prod_target_cph"] = hourly["_prod_target_cph"].fillna(benchmark_cph)
+        hourly["cases_gap"] = (hourly["_prod_target_cph"] - hourly["cases_per_hour"]).clip(lower=0) * hourly["total_hours"]
+        # Compute product-aware total target for the period
+        product_target_total = (hourly["_prod_target_cph"] * hourly["total_hours"]).sum()
+        product_target_cph_avg = product_target_total / total_hours if total_hours > 0 else benchmark_cph
+        hourly.drop(columns=["_prod_target_cph"], inplace=True, errors="ignore")
+    else:
+        hourly["cases_gap"] = (benchmark_cph - hourly["cases_per_hour"]).clip(lower=0) * hourly["total_hours"]
+        product_target_total = benchmark_cph * total_hours
+        product_target_cph_avg = benchmark_cph
+
     total_cases_lost = hourly["cases_gap"].sum()
 
     date_min = hourly["date"].min().strftime("%Y-%m-%d")
@@ -984,7 +998,8 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     add_exec("Total Cases Produced", f"{total_cases:,.0f}")
     add_exec("Total Production Hours", f"{total_hours:,.1f}")
     add_exec("Average Cases/Hour", f"{avg_cph:,.0f}")
-    add_exec("90th Percentile CPH (Benchmark)", f"{target_cph:,.0f}")
+    add_exec("Target Cases/Hour (Plant Std)", f"{product_target_cph_avg:,.0f}")
+    add_exec("90th Percentile CPH (Best Hrs)", f"{benchmark_cph:,.0f}")
     add_exec("", "")
     add_exec("Average OEE", f"{avg_oee:.1f}% (Target: 50%)")
     add_exec("OEE Gap to Target", f"{50.0 - avg_oee:.1f} points to close")
@@ -1004,8 +1019,9 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     add_exec("Worst Shift", f"{bot_shift['shift']} ({bot_shift['oee_pct']:.1f}% OEE)")
     add_exec("Shift Gap", f"{top_shift['oee_pct'] - bot_shift['oee_pct']:.1f} OEE points")
     add_exec("", "")
-    add_exec("Est. Cases Lost vs Benchmark", f"{total_cases_lost:,.0f}")
-    add_exec("Cases Lost Per Day", f"{total_cases_lost / n_days:,.0f}")
+    add_exec("Target Cases (Plant Std)", f"{product_target_total:,.0f}")
+    add_exec("Cases vs Target", f"{total_cases - product_target_total:+,.0f}")
+    add_exec("% of Target", f"{total_cases / product_target_total * 100:.1f}%" if product_target_total > 0 else "N/A")
 
     if has_downtime:
         add_exec("", "")
@@ -1338,17 +1354,24 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     results["Worst Hours"] = worst
 
     # ===================================================================
-    # TAB 10: DAILY TREND
+    # TAB 10: DAILY TREND (product-aware targets from plant standards)
     # ===================================================================
-    # Compute from hourly data directly (more accurate than shift_summary aggregation)
+    # Compute target CPH per hour based on product running
+    hourly["_target_cph"] = hourly["product_code"].apply(get_target_cph) if "product_code" in hourly.columns else np.nan
+    # Fallback: use 90th percentile benchmark when product unknown
+    hourly["_target_cph"] = hourly["_target_cph"].fillna(target_cph)
+    hourly["_target_cases"] = hourly["_target_cph"] * hourly["total_hours"]
+
     shift_summary["_w_oee"] = shift_summary["oee_pct"] * shift_summary["total_hours"]
     daily = (
         hourly.groupby("date_str")
         .agg(total_cases=("total_cases", "sum"),
              total_hours=("total_hours", "sum"),
-             good_cases=("good_cases", "sum") if "good_cases" in hourly.columns else ("total_cases", "sum"))
+             target_cases=("_target_cases", "sum"))
         .reset_index()
     )
+    hourly.drop(columns=["_target_cph", "_target_cases"], inplace=True, errors="ignore")
+
     # Weighted OEE from shift_summary (avoids double-counting sub-hour intervals)
     daily_oee = (
         shift_summary.groupby("date_str")
@@ -1361,19 +1384,20 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
 
     daily["total_hours"] = daily["total_hours"].round(1)
     daily["cases_per_hour"] = (daily["total_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
+    daily["target_cph"] = (daily["target_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
     daily["total_cases"] = daily["total_cases"].round(0)
-    # Target cases = CPH benchmark * hours
-    daily["target_cases"] = (target_cph * daily["total_hours"]).round(0)
+    daily["target_cases"] = daily["target_cases"].round(0)
     daily["cases_vs_target"] = (daily["total_cases"] - daily["target_cases"]).round(0)
+    daily["pct_of_target"] = (daily["total_cases"] / daily["target_cases"].replace(0, np.nan) * 100).fillna(0).round(1)
     daily = daily.sort_values("date_str")
     daily["oee_7day_avg"] = daily["avg_oee"].rolling(7, min_periods=1).mean().round(1)
     daily["cph_7day_avg"] = daily["cases_per_hour"].rolling(7, min_periods=1).mean().round(0)
-    daily_out = daily[["date_str", "n_shifts", "total_hours", "cases_per_hour", "total_cases",
-                       "target_cases", "cases_vs_target",
-                       "cph_7day_avg", "avg_oee", "oee_7day_avg"]].copy()
-    daily_out.columns = ["Date", "Shifts", "Sched Hours", "Cases/Hr", "Actual Cases",
-                         "Target Cases (Benchmark)", "Cases vs Target",
-                         "CPH 7-Day Avg", "OEE %", "OEE 7-Day Avg"]
+    daily_out = daily[["date_str", "n_shifts", "total_hours", "cases_per_hour", "target_cph",
+                       "total_cases", "target_cases", "cases_vs_target", "pct_of_target",
+                       "avg_oee", "oee_7day_avg"]].copy()
+    daily_out.columns = ["Date", "Shifts", "Sched Hours", "Cases/Hr", "Target CPH",
+                         "Actual Cases", "Target Cases", "vs Target", "% of Target",
+                         "OEE %", "OEE 7-Day Avg"]
     results["Daily Trend"] = daily_out
 
     # ===================================================================
@@ -1941,17 +1965,82 @@ def main():
         else:
             print(f"Warning: Downtime file not found: {downtime_file}")
 
-    results = analyze(hourly, shift_summary, overall, hour_avg, downtime)
-
+    # Split into one day at a time
+    dates = sorted(hourly["date_str"].unique())
     basename = os.path.splitext(os.path.basename(oee_file))[0]
     output_dir = os.path.dirname(oee_file)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     suffix = "_FULL_ANALYSIS" if downtime else "_ANALYSIS"
-    output_path = os.path.join(output_dir, f"{basename}{suffix}_{timestamp}.xlsx")
 
-    write_excel(results, output_path)
+    for date_str in dates:
+        print(f"\n{'='*60}")
+        print(f"  Analyzing: {date_str}")
+        print(f"{'='*60}")
 
-    # Console summary
+        # Filter OEE data to this date
+        day_hourly = hourly[hourly["date_str"] == date_str].copy().reset_index(drop=True)
+        day_shift_summary = shift_summary[shift_summary["date_str"] == date_str].copy().reset_index(drop=True)
+
+        # Rebuild overall (per-shift aggregates) for this day only
+        day_overall = (
+            day_shift_summary.groupby("shift")
+            .agg({c: "sum" if c in ["total_cases", "total_hours", "good_cases", "bad_cases"] else "first"
+                  for c in day_shift_summary.columns if c != "shift"})
+            .reset_index()
+        )
+        if "oee_pct" in day_overall.columns and "total_hours" in day_overall.columns:
+            for _, row in day_overall.iterrows():
+                s_data = day_hourly[day_hourly["shift"] == row["shift"]]
+                if len(s_data) > 0:
+                    sa, sp, sq, soee = _aggregate_oee(s_data)
+                    day_overall.loc[day_overall["shift"] == row["shift"], "oee_pct"] = soee
+                    day_overall.loc[day_overall["shift"] == row["shift"], "cases_per_hour"] = (
+                        s_data["total_cases"].sum() / s_data["total_hours"].sum()
+                        if s_data["total_hours"].sum() > 0 else 0
+                    )
+
+        # Use full hour_avg (shift-hour averages don't change by date)
+        day_hour_avg = hour_avg
+
+        # Filter downtime events to this date
+        day_downtime = None
+        if downtime is not None:
+            day_downtime = dict(downtime)  # shallow copy
+            if "events_df" in downtime and downtime["events_df"] is not None and len(downtime["events_df"]) > 0:
+                edf = downtime["events_df"]
+                day_events = edf[edf["start_time"].dt.strftime("%Y-%m-%d") == date_str].copy()
+                day_downtime["events_df"] = day_events.reset_index(drop=True)
+                # Rebuild shift_reasons_df for this day
+                if len(day_events) > 0:
+                    sr = day_events.groupby(["shift", "reason"]).agg(
+                        count=("duration_minutes", "size"),
+                        total_minutes=("duration_minutes", "sum")
+                    ).reset_index()
+                    day_downtime["shift_reasons_df"] = sr
+                else:
+                    day_downtime["shift_reasons_df"] = pd.DataFrame()
+            # Filter reasons_df to this day's events if available
+            if "events_df" in day_downtime and len(day_downtime.get("events_df", [])) > 0:
+                day_ev = day_downtime["events_df"]
+                day_reasons = day_ev.groupby("reason").agg(
+                    total_minutes=("duration_minutes", "sum"),
+                    total_occurrences=("duration_minutes", "size")
+                ).reset_index()
+                day_reasons["total_hours"] = day_reasons["total_minutes"] / 60
+                day_downtime["reasons_df"] = day_reasons
+
+        results = analyze(day_hourly, day_shift_summary, day_overall, day_hour_avg, day_downtime)
+
+        date_label = date_str.replace("-", "")
+        output_path = os.path.join(output_dir, f"{basename}_{date_label}{suffix}_{timestamp}.xlsx")
+        write_excel(results, output_path)
+
+        # Console summary
+        _print_summary(results, output_path)
+
+
+def _print_summary(results, output_path):
+    """Print console summary for one day's analysis."""
     print("\n" + "=" * 60)
     print("QUICK SUMMARY")
     print("=" * 60)

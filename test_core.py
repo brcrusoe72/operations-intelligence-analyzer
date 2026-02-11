@@ -737,3 +737,242 @@ class TestBuildShiftNarrative:
             dead_hours_total=0, dead_count=0,
         ))
         assert len(narrative) > 50
+
+
+# =====================================================================
+# parse_passdown — Shift Passdown Spreadsheet Parser
+# =====================================================================
+
+class TestParsePassdown:
+    """Tests for parse_passdown module."""
+
+    def _make_workbook(self, tmp_path, sheets, old_format=True):
+        """Create a minimal passdown workbook for testing.
+
+        sheets: list of dicts with 'name' and 'events' keys.
+        Each event: {area, issue, shift, line, date, time_min}
+        """
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "placeholder"
+
+        for sheet_info in sheets:
+            ws = wb.create_sheet(title=sheet_info["name"])
+            # Write header row (row 2)
+            if old_format:
+                ws.cell(2, 4, "Shift")
+                ws.cell(2, 5, "Line")
+                ws.cell(2, 6, "Date")
+                ws.cell(2, 8, "Area")
+                ws.cell(2, 9, "Details")
+                ws.cell(2, 15, "Time(min)")
+                ws.cell(2, 16, "Notes:")
+            else:
+                ws.cell(2, 4, "Shift")
+                ws.cell(2, 5, "Line")
+                ws.cell(2, 6, "Date")
+                ws.cell(2, 8, "Area")
+                ws.cell(2, 9, "ISSUE")
+                ws.cell(2, 15, "ACTION")
+                ws.cell(2, 16, "RESULT")
+                ws.cell(2, 17, "Time(min)")
+                ws.cell(2, 18, "Notes:")
+
+            row = 3
+            for ev in sheet_info.get("events", []):
+                ws.cell(row, 4, ev.get("shift", ""))
+                ws.cell(row, 5, ev.get("line", ""))
+                ws.cell(row, 6, ev.get("date"))
+                ws.cell(row, 8, ev.get("area", ""))
+                if old_format:
+                    ws.cell(row, 9, ev.get("issue", ""))
+                    ws.cell(row, 15, ev.get("time_min", 0))
+                else:
+                    ws.cell(row, 9, ev.get("issue", ""))
+                    ws.cell(row, 15, ev.get("action", ""))
+                    ws.cell(row, 16, ev.get("result", ""))
+                    ws.cell(row, 17, ev.get("time_min", 0))
+                row += 1
+
+        # Remove placeholder sheet
+        del wb["placeholder"]
+
+        path = tmp_path / "test_passdown.xlsx"
+        wb.save(str(path))
+        return str(path)
+
+    def test_returns_expected_keys(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [{"area": "Caser", "issue": "jam", "shift": "3rd", "line": "2",
+                         "date": datetime(2025, 12, 3), "time_min": 15}],
+        }])
+        result = parse_passdown(path)
+        expected_keys = {"reasons_df", "events_df", "shift_reasons_df",
+                         "pareto_df", "findings", "shift_samples",
+                         "event_samples", "meta", "oee_summary", "pareto_raw"}
+        assert set(result.keys()) == expected_keys
+
+    def test_events_df_columns(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [{"area": "Caser", "issue": "jam", "shift": "3rd", "line": "2",
+                         "date": datetime(2025, 12, 3), "time_min": 15}],
+        }])
+        result = parse_passdown(path)
+        edf = result["events_df"]
+        for col in ["reason", "start_time", "end_time", "shift", "oee_type", "duration_minutes"]:
+            assert col in edf.columns, f"Missing column: {col}"
+
+    def test_reason_format(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [{"area": "Bear Labeler", "issue": "loose labels",
+                         "shift": "3rd", "line": "2",
+                         "date": datetime(2025, 12, 3), "time_min": 10}],
+        }])
+        result = parse_passdown(path)
+        assert result["events_df"].iloc[0]["reason"] == "Bear Labeler: loose labels"
+
+    def test_old_format_parsing(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [
+                {"area": "Caser", "issue": "pallet chain broke", "shift": "3rd",
+                 "line": "2", "date": datetime(2025, 12, 3), "time_min": 30},
+                {"area": "Nordson", "issue": "glue issue", "shift": "3rd",
+                 "line": "2", "date": datetime(2025, 12, 3), "time_min": 15},
+            ],
+        }], old_format=True)
+        result = parse_passdown(path)
+        assert len(result["events_df"]) == 2
+        assert result["events_df"]["oee_type"].iloc[0] == "Availability Loss"
+
+    def test_new_format_parsing(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-16-25",
+            "events": [
+                {"area": "Double Stacker", "issue": "sensor gap",
+                 "shift": "3rd", "line": "3",
+                 "date": datetime(2025, 12, 16), "time_min": 20,
+                 "action": "adjusted sensor", "result": "fixed"},
+            ],
+        }], old_format=False)
+        result = parse_passdown(path)
+        assert len(result["events_df"]) == 1
+        assert result["events_df"].iloc[0]["reason"] == "Double Stacker: sensor gap"
+
+    def test_skips_non_data_sheets(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [
+            {"name": "12-3-25",
+             "events": [{"area": "Caser", "issue": "jam", "shift": "3rd",
+                          "line": "2", "date": datetime(2025, 12, 3), "time_min": 15}]},
+            {"name": "Reference", "events": []},
+        ])
+        # Reference sheet has headers but no events; verify no crash
+        result = parse_passdown(path)
+        assert len(result["events_df"]) == 1
+
+    def test_reasons_df_aggregation(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [
+                {"area": "Caser", "issue": "jam", "shift": "3rd",
+                 "line": "2", "date": datetime(2025, 12, 3), "time_min": 30},
+                {"area": "Caser", "issue": "jam", "shift": "3rd",
+                 "line": "2", "date": datetime(2025, 12, 3), "time_min": 15},
+            ],
+        }])
+        result = parse_passdown(path)
+        rdf = result["reasons_df"]
+        caser_row = rdf[rdf["reason"] == "Caser: jam"]
+        assert len(caser_row) == 1
+        assert caser_row.iloc[0]["total_minutes"] == 45.0
+        assert caser_row.iloc[0]["total_occurrences"] == 2
+
+    def test_shift_reasons_df(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [
+                {"area": "Caser", "issue": "jam", "shift": "3rd",
+                 "line": "2", "date": datetime(2025, 12, 3), "time_min": 30},
+            ],
+        }])
+        result = parse_passdown(path)
+        srdf = result["shift_reasons_df"]
+        assert len(srdf) == 1
+        assert srdf.iloc[0]["shift"] == "3rd Shift"
+
+    def test_empty_workbook_returns_empty_dfs(self, tmp_path):
+        """A workbook with no data events should return empty DataFrames."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Reference"
+        path = tmp_path / "empty_passdown.xlsx"
+        wb.save(str(path))
+
+        from parse_passdown import parse_passdown
+        result = parse_passdown(str(path))
+        assert len(result["events_df"]) == 0
+        assert len(result["reasons_df"]) == 0
+
+    def test_detect_passdown_true(self, tmp_path):
+        from parse_passdown import detect_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [{"area": "Caser", "issue": "jam", "shift": "3rd",
+                         "line": "2", "date": datetime(2025, 12, 3), "time_min": 15}],
+        }])
+        assert detect_passdown(path) is True
+
+    def test_detect_passdown_false(self, tmp_path):
+        """A workbook without Area/ISSUE headers should return False."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.cell(1, 1, "OEE Period Detail")
+        path = tmp_path / "not_passdown.xlsx"
+        wb.save(str(path))
+        from parse_passdown import detect_passdown
+        assert detect_passdown(str(path)) is False
+
+    def test_multi_sheet_aggregation(self, tmp_path):
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [
+            {"name": "12-3-25",
+             "events": [{"area": "Caser", "issue": "jam", "shift": "3rd",
+                          "line": "2", "date": datetime(2025, 12, 3), "time_min": 15}]},
+            {"name": "12-4-25",
+             "events": [{"area": "Nordson", "issue": "glue", "shift": "3rd",
+                          "line": "2", "date": datetime(2025, 12, 4), "time_min": 20}]},
+        ])
+        result = parse_passdown(path)
+        assert len(result["events_df"]) == 2
+        assert len(result["reasons_df"]) == 2
+
+    def test_shift_carry_forward(self, tmp_path):
+        """Shift value should carry forward to rows where it's missing."""
+        from parse_passdown import parse_passdown
+        path = self._make_workbook(tmp_path, [{
+            "name": "12-3-25",
+            "events": [
+                {"area": "Caser", "issue": "jam", "shift": "3rd",
+                 "line": "2", "date": datetime(2025, 12, 3), "time_min": 15},
+                {"area": "Nordson", "issue": "glue issue", "shift": "",
+                 "line": "", "date": None, "time_min": 10},
+            ],
+        }])
+        result = parse_passdown(path)
+        assert len(result["events_df"]) == 2
+        # Second event should inherit shift from first
+        assert result["events_df"].iloc[1]["shift"] == "3rd Shift"

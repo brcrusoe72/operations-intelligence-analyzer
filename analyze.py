@@ -2308,6 +2308,10 @@ def main():
                 if dt_type == "event_summary":
                     print("  Detected: Traksys Event Summary export")
                     downtime = parse_event_summary(downtime_file)
+                elif dt_type == "passdown":
+                    from parse_passdown import parse_passdown
+                    print("  Detected: Shift Passdown Report")
+                    downtime = parse_passdown(downtime_file)
                 else:
                     print(f"  Warning: Unrecognized downtime file format ({dt_type})")
         else:

@@ -459,12 +459,19 @@ def parse_event_summary(filepath):
 # ---------------------------------------------------------------------------
 # Format Detection
 # ---------------------------------------------------------------------------
+def _is_passdown(filepath):
+    """Check if a file is a shift passdown spreadsheet."""
+    from parse_passdown import detect_passdown
+    return detect_passdown(filepath)
+
+
 def detect_file_type(filepath):
     """
     Detect file format:
       'old_oee'            — processed workbook with DayShiftHour sheets
       'oee_period_detail'  — raw Traksys OEE Period Detail export
       'event_summary'      — raw Traksys Event Summary (Date) export
+      'passdown'           — shift passdown spreadsheet (operator notes)
       'unknown'
     """
     try:
@@ -485,6 +492,9 @@ def detect_file_type(filepath):
 
         if b1 and "OEE" in str(b1):
             return "oee_period_detail"
+
+        if _is_passdown(filepath):
+            return "passdown"
 
         return "unknown"
     except Exception:

@@ -104,6 +104,10 @@ with tab_analyze:
                                 if dt_type == "event_summary":
                                     st.info("Detected: Traksys Event Summary export")
                                     downtime = parse_event_summary(dt_path)
+                                elif dt_type == "passdown":
+                                    from parse_passdown import parse_passdown
+                                    st.info("Detected: Shift Passdown Report")
+                                    downtime = parse_passdown(dt_path)
                                 else:
                                     st.warning("Unrecognized downtime file format")
                         except Exception as e:

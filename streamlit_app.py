@@ -68,8 +68,18 @@ with tab_analyze:
         downtime_file = st.file_uploader(
             "Downtime Data (Excel or JSON) — optional",
             type=["json", "xlsx", "xls"],
-            help="Traksys 'Event Summary' export (.xlsx) or knowledge base (.json)",
+            help="Event Summary (.xlsx), Shift Passdown (.xlsx), or knowledge base (.json)",
         )
+
+    context_files = st.file_uploader(
+        "Additional Context — optional (up to 6 photos or Excel files)",
+        type=["png", "jpg", "jpeg", "xlsx", "xls"],
+        accept_multiple_files=True,
+        help="Shift photos, work orders, passdown sheets — anything that adds context to the analysis",
+    )
+    if context_files and len(context_files) > 6:
+        st.warning("Maximum 6 context files. Only the first 6 will be used.")
+        context_files = context_files[:6]
 
     # --- Analyze ---
     if oee_file is not None:
@@ -112,6 +122,41 @@ with tab_analyze:
                                     st.warning("Unrecognized downtime file format")
                         except Exception as e:
                             st.warning(f"Could not load downtime data: {e}")
+
+                    # Process context files (photos + additional Excel)
+                    context_photos = []
+                    if context_files:
+                        from parse_passdown import parse_passdown, detect_passdown
+                        for cf in context_files:
+                            cf_path = os.path.join(tmp_dir, cf.name)
+                            with open(cf_path, "wb") as f:
+                                f.write(cf.getbuffer())
+                            name_lower = cf.name.lower()
+                            if name_lower.endswith((".png", ".jpg", ".jpeg")):
+                                context_photos.append((cf.name, cf_path))
+                            elif name_lower.endswith((".xlsx", ".xls")):
+                                try:
+                                    if detect_passdown(cf_path):
+                                        extra = parse_passdown(cf_path)
+                                        if downtime is None:
+                                            downtime = extra
+                                            st.info(f"Context: {cf.name} — Shift Passdown ({len(extra['events_df'])} events)")
+                                        else:
+                                            # Merge events into existing downtime
+                                            import pandas as _pd
+                                            downtime["events_df"] = _pd.concat(
+                                                [downtime["events_df"], extra["events_df"]], ignore_index=True)
+                                            downtime["reasons_df"] = _pd.concat(
+                                                [downtime["reasons_df"], extra["reasons_df"]], ignore_index=True)
+                                            if len(extra.get("shift_reasons_df", _pd.DataFrame())) > 0:
+                                                downtime["shift_reasons_df"] = _pd.concat(
+                                                    [downtime["shift_reasons_df"], extra["shift_reasons_df"]],
+                                                    ignore_index=True)
+                                            st.info(f"Context: {cf.name} — merged {len(extra['events_df'])} passdown events")
+                                    else:
+                                        st.info(f"Context: {cf.name} — uploaded (not a recognized format)")
+                                except Exception as e:
+                                    st.warning(f"Could not parse {cf.name}: {e}")
 
                     # Single file per analysis run
                     dates = sorted(hourly["date_str"].unique())
@@ -166,6 +211,14 @@ with tab_analyze:
                     if focus_df is not None:
                         for _, row in focus_df.head(3).iterrows():
                             st.markdown(f"**#{row['Priority']}:** {row['Finding']}")
+
+                    # Display context photos
+                    if context_photos:
+                        with st.expander(f"Context Photos ({len(context_photos)})"):
+                            photo_cols = st.columns(min(3, len(context_photos)))
+                            for i, (pname, ppath) in enumerate(context_photos):
+                                with photo_cols[i % 3]:
+                                    st.image(ppath, caption=pname, use_container_width=True)
 
                     st.caption(f"Sheets: {', '.join(results.keys())}")
 

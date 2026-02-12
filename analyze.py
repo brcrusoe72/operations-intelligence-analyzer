@@ -1601,34 +1601,15 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
 # ---------------------------------------------------------------------------
 # Main Analysis
 # ---------------------------------------------------------------------------
-def analyze(hourly, shift_summary, overall, hour_avg, downtime=None,
-            exclude_shifts=None):
+def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     """Produce shift-centric analysis: Plant Summary + per-shift sheets + What to Focus On.
-
-    Parameters
-    ----------
-    exclude_shifts : list[str] or None
-        Shift display names to drop before analysis (e.g. ["3rd Shift"]).
-        Matching is prefix-based so "3rd" will match "3rd (11p-7a)".
 
     Returns dict where:
       - "Plant Summary" → dict with sub-tables (title, subtitle, kpis, shift_comparison, etc.)
-      - "1st Shift" / "2nd Shift" / ... → dict with narrative + sub-tables
+      - "1st Shift" / "2nd Shift" / "3rd Shift" → dict with narrative + sub-tables
       - "What to Focus On" → DataFrame (unchanged)
     """
     results = {}
-
-    # --- Filter out excluded shifts early so all downstream metrics are clean ---
-    if exclude_shifts:
-        def _shift_excluded(shift_val):
-            s = str(shift_val).lower()
-            return any(s.startswith(ex.lower().rstrip(" shift"))
-                       for ex in exclude_shifts)
-        for df in [hourly, shift_summary, overall, hour_avg]:
-            if "shift" in df.columns:
-                mask = df["shift"].apply(_shift_excluded)
-                df.drop(df[mask].index, inplace=True)
-                df.reset_index(drop=True, inplace=True)
 
     # === CORE METRICS ===
     total_cases = hourly["total_cases"].sum()

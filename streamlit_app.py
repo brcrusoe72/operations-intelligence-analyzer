@@ -22,6 +22,7 @@ import pandas as pd
 from analyze import load_oee_data, load_downtime_data, analyze, write_excel
 from parse_traksys import parse_oee_period_detail, parse_event_summary, detect_file_type
 from oee_history import save_run, load_trends
+from eos_report import generate_eos_report_bytes
 
 st.set_page_config(
     page_title="Traksys OEE Analyzer",
@@ -33,7 +34,7 @@ st.title("Traksys OEE Analyzer")
 st.markdown("Upload your OEE export. Get back a formatted analysis workbook with shift deep dives, loss breakdowns, and prioritized actions.")
 
 # --- Tab navigation ---
-tab_analyze, tab_history = st.tabs(["Analyze", "Plant History"])
+tab_analyze, tab_eos, tab_history = st.tabs(["Analyze", "EOS Report", "Plant History"])
 
 # =====================================================================
 # TAB 1: ANALYZE (original functionality)
@@ -237,7 +238,85 @@ with tab_analyze:
         st.info("Upload a Traksys OEE export (.xlsx) to get started.")
 
 # =====================================================================
-# TAB 2: PLANT HISTORY (SPC + Gardener Intelligence)
+# TAB 2: EOS MEETING REPORT
+# =====================================================================
+with tab_eos:
+    st.subheader("EOS Meeting Report")
+    st.markdown(
+        "Upload up to **6 analysis Excel files** (the output from Analyze tab) "
+        "to generate a **2-page PDF** with consolidated KPIs, shift performance, "
+        "root cause analysis, and prioritized action items for your Level 10 meeting."
+    )
+
+    eos_files = st.file_uploader(
+        "Analysis Excel Files (up to 6)",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        help="Upload the _ANALYSIS or _FULL_ANALYSIS Excel files produced by the Analyze tab",
+        key="eos_uploader",
+    )
+    if eos_files and len(eos_files) > 6:
+        st.warning("Maximum 6 files. Only the first 6 will be used.")
+        eos_files = eos_files[:6]
+
+    if eos_files:
+        st.info(f"{len(eos_files)} file(s) uploaded: {', '.join(f.name for f in eos_files)}")
+
+        if st.button("Generate EOS Report", type="primary", use_container_width=True):
+            with st.spinner("Building 2-page EOS PDF..."):
+                tmp_dir = tempfile.mkdtemp()
+                try:
+                    # Write uploaded files to temp directory
+                    tmp_paths = []
+                    for ef in eos_files:
+                        ef_path = os.path.join(tmp_dir, ef.name)
+                        with open(ef_path, "wb") as f:
+                            f.write(ef.getbuffer())
+                        tmp_paths.append(ef_path)
+
+                    pdf_bytes, eos_data = generate_eos_report_bytes(tmp_paths)
+
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+                    pdf_name = f"EOS_Report_{timestamp}.pdf"
+
+                    st.download_button(
+                        label=f"Download {pdf_name}",
+                        data=pdf_bytes,
+                        file_name=pdf_name,
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+
+                    st.success(
+                        f"EOS Report generated: {eos_data['n_files']} file(s), "
+                        f"{eos_data['n_days']} day(s), {eos_data['date_range']}"
+                    )
+
+                    # Show consolidated KPIs
+                    kpis = eos_data.get("kpis", {})
+                    if kpis:
+                        kpi_items = list(kpis.items())
+                        mcols = st.columns(min(4, len(kpi_items)))
+                        for i, (metric, value) in enumerate(kpi_items[:4]):
+                            mcols[i].metric(metric, str(value))
+
+                    # Show top 3 IDS items
+                    ids_items = eos_data.get("ids_items", [])
+                    if ids_items:
+                        st.subheader("Top IDS Items")
+                        for item in ids_items:
+                            st.markdown(f"**#{item.get('Priority', '?')}:** {item.get('Finding', '')}")
+
+                except Exception as e:
+                    st.error(f"EOS report generation failed: {e}")
+                    st.exception(e)
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        st.info("Upload analysis Excel files to generate your EOS meeting report.")
+
+# =====================================================================
+# TAB 3: PLANT HISTORY (SPC + Gardener Intelligence)
 # =====================================================================
 with tab_history:
     trends = load_trends()

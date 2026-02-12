@@ -214,7 +214,8 @@ with tab_analyze:
 
                     # Display context photos
                     if context_photos:
-                        with st.expander(f"Context Photos ({len(context_photos)})"):
+                        with st.expander(f"Context Photos ({len(context_photos)})", expanded=True):
+                            st.caption("Photos are displayed for reference. Automated photo analysis is not yet available.")
                             photo_cols = st.columns(min(3, len(context_photos)))
                             for i, (pname, ppath) in enumerate(context_photos):
                                 with photo_cols[i % 3]:

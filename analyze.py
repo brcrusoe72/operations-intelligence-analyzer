@@ -1111,7 +1111,9 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
                 cause_agg.columns = ["Cause", "Events", "Total Min", "Avg Min", "% of Shift"]
                 downtime_causes_df = cause_agg
                 if len(cause_agg) > 0:
-                    top_cause_str = cause_agg.iloc[0]["Cause"]
+                    top_cause_str = str(cause_agg.iloc[0]["Cause"])
+                    if len(top_cause_str) > 80:
+                        top_cause_str = top_cause_str[:77] + "..."
                     top_cause_min = cause_agg.iloc[0]["Total Min"]
                     top_cause_events = cause_agg.iloc[0]["Events"]
     elif has_downtime:
@@ -1125,7 +1127,9 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
             dc["pct"] = (dc["total_minutes"] / total_min * 100).round(1) if total_min > 0 else 0
             dc.columns = ["Cause", "Events", "Total Min", "Avg Min", "% of Shift"]
             downtime_causes_df = dc
-            top_cause_str = dc.iloc[0]["Cause"]
+            top_cause_str = str(dc.iloc[0]["Cause"])
+            if len(top_cause_str) > 80:
+                top_cause_str = top_cause_str[:77] + "..."
             top_cause_min = dc.iloc[0]["Total Min"]
             top_cause_events = dc.iloc[0]["Events"]
 
@@ -1213,13 +1217,32 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
                                     + timedelta(days=1)).strftime("%Y-%m-%d")
                     hr_start = datetime.strptime(f"{cal_date} {clock_hour:02d}:00:00", "%Y-%m-%d %H:%M:%S")
                     hr_end = hr_start + timedelta(hours=1)
-                    overlaps = events_df_w[
-                        (events_df_w["start_time"] < hr_end) & (events_df_w["end_time"] > hr_start)
-                    ]
+                    # Events with exact timestamps: match by time overlap
+                    has_end = events_df_w["end_time"].apply(lambda x: isinstance(x, datetime))
+                    exact = events_df_w[has_end]
+                    approx = events_df_w[~has_end]
+                    overlaps_exact = exact[
+                        (exact["start_time"] < hr_end) & (exact["end_time"] > hr_start)
+                    ] if len(exact) > 0 else pd.DataFrame()
+                    # Events without end_time (e.g. passdown): match by shift + date
+                    overlaps_approx = pd.DataFrame()
+                    if len(approx) > 0:
+                        approx_match = approx[
+                            (approx["shift"] == shift_name) &
+                            (approx["start_time"].apply(
+                                lambda x: x.strftime("%Y-%m-%d") if isinstance(x, datetime) else ""
+                            ) == wrow["date_str"])
+                        ]
+                        if len(approx_match) > 0:
+                            overlaps_approx = approx_match
+                    overlaps = pd.concat([overlaps_exact, overlaps_approx], ignore_index=True)
                     if len(overlaps) > 0:
                         overlaps = overlaps.copy()
-                        overlaps["overlap"] = overlaps.apply(
-                            lambda e: (min(e["end_time"], hr_end) - max(e["start_time"], hr_start)).total_seconds() / 60, axis=1)
+                        def _calc_overlap(e):
+                            if isinstance(e["end_time"], datetime):
+                                return (min(e["end_time"], hr_end) - max(e["start_time"], hr_start)).total_seconds() / 60
+                            return e.get("duration_minutes", 0)
+                        overlaps["overlap"] = overlaps.apply(_calc_overlap, axis=1)
                         top = overlaps.groupby("reason")["overlap"].sum().sort_values(ascending=False)
                         event_str = "; ".join(f"{r}: {m:.0f}min" for r, m in top.head(3).items())
 
@@ -1274,6 +1297,8 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
         "top_cause": top_cause_str,
         "top_cause_min": top_cause_min,
         "top_cause_events": top_cause_events,
+        "operator_downtime_min": downtime_causes_df["Total Min"].sum() if len(downtime_causes_df) > 0 else 0,
+        "operator_downtime_events": int(downtime_causes_df["Events"].sum()) if len(downtime_causes_df) > 0 else 0,
     }
 
     return {
@@ -1315,31 +1340,59 @@ def _build_shift_narrative(shift_data):
 
     # --- Paragraph 2: Why ---
     parts2 = []
-    parts2.append(
-        f"The primary loss driver was {r['primary_loss']} "
-        f"({r['primary_loss_pct']:.0f}% of total loss)."
-    )
 
-    if r["primary_loss"] == "Availability":
-        dead_str = f"{r['dead_hours_total']} hours" if r["dead_hours_total"] > 0 else "some time"
-        cause_str = ""
+    # When operators reported significant availability events, the OEE "performance"
+    # number is misleading — short stops the machine doesn't flag as downtime show up
+    # as speed loss.  Let operator data override the narrative when it tells a
+    # different story than the OEE math.
+    op_min = r.get("operator_downtime_min", 0)
+    op_events = r.get("operator_downtime_events", 0)
+    oee_says_perf = r["primary_loss"] == "Performance"
+    operators_say_avail = op_min > 0 and op_events > 0
+
+    if oee_says_perf and operators_say_avail and op_min >= 60:
+        # Operators reported substantial availability events — lead with that
+        parts2.append(
+            f"OEE math shows Performance as the largest component "
+            f"({r['primary_loss_pct']:.0f}% of loss), but operator-reported "
+            f"downtime tells a different story: {op_events} events totaling "
+            f"{op_min:,.0f} min of availability loss."
+        )
         if r["top_cause"]:
-            cause_str = f" due to {r['top_cause']} ({r['top_cause_min']:.0f} min across {r['top_cause_events']} events)"
+            parts2.append(
+                f"Top cause: {r['top_cause']} ({r['top_cause_min']:.0f} min across "
+                f"{r['top_cause_events']} events)."
+            )
         parts2.append(
-            f"Availability dragged OEE — the line wasn't running {dead_str}{cause_str}."
+            f"When the line was running it averaged {r['cph']:,.0f} CPH vs "
+            f"{r['target_cph']:,.0f} target — but the stops are the bigger problem."
         )
-    elif r["primary_loss"] == "Performance":
+    else:
         parts2.append(
-            f"Performance was the gap — when running, the line averaged "
-            f"{r['cph']:,.0f} CPH vs {r['target_cph']:,.0f} target."
-        )
-    elif r["primary_loss"] == "Quality":
-        bad_cases = r["cases"] * (1 - r["qual"])
-        parts2.append(
-            f"Quality losses of {r['qual_loss']:.1f}% indicate ~{bad_cases:,.0f} rejected cases."
+            f"The primary loss driver was {r['primary_loss']} "
+            f"({r['primary_loss_pct']:.0f}% of total loss)."
         )
 
-    if r["primary_loss"] != "Availability" and r["dead_hours_total"] > 0:
+        if r["primary_loss"] == "Availability":
+            dead_str = f"{r['dead_hours_total']} hours" if r["dead_hours_total"] > 0 else "some time"
+            cause_str = ""
+            if r["top_cause"]:
+                cause_str = f" due to {r['top_cause']} ({r['top_cause_min']:.0f} min across {r['top_cause_events']} events)"
+            parts2.append(
+                f"Availability dragged OEE — the line wasn't running {dead_str}{cause_str}."
+            )
+        elif r["primary_loss"] == "Performance":
+            parts2.append(
+                f"Performance was the gap — when running, the line averaged "
+                f"{r['cph']:,.0f} CPH vs {r['target_cph']:,.0f} target."
+            )
+        elif r["primary_loss"] == "Quality":
+            bad_cases = r["cases"] * (1 - r["qual"])
+            parts2.append(
+                f"Quality losses of {r['qual_loss']:.1f}% indicate ~{bad_cases:,.0f} rejected cases."
+            )
+
+    if r["primary_loss"] != "Availability" and not (oee_says_perf and operators_say_avail and op_min >= 60) and r["dead_hours_total"] > 0:
         parts2.append(
             f"Additionally, {r['dead_hours_total']} dead hours had zero production."
         )
@@ -1364,9 +1417,17 @@ def _build_shift_narrative(shift_data):
             f"{avail_hrs_lost:.0f} hrs of scheduled time not running"
         )
     elif r["primary_loss"] == "Performance" and r["perf_loss"] > 10:
-        actions.append(
-            f"Close speed gap — running at {r['cph']:,.0f} CPH vs {r['target_cph']:,.0f} target"
-        )
+        if operators_say_avail and op_min >= 60:
+            # Operators say stops are the real problem — lead with availability
+            avail_hrs_lost = (1 - r["avail"]) * r["hours"]
+            actions.append(
+                f"Reduce stops first — operators reported {op_min:,.0f} min of downtime; "
+                f"availability is {r['avail']:.0%} ({avail_hrs_lost:.0f} hrs lost)"
+            )
+        else:
+            actions.append(
+                f"Close speed gap — running at {r['cph']:,.0f} CPH vs {r['target_cph']:,.0f} target"
+            )
 
     if r["dead_hours_total"] > 0:
         recoverable_dead = r["dead_hours_total"] * r["target_cph"]

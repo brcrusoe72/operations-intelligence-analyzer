@@ -81,6 +81,13 @@ with tab_analyze:
         st.warning("Maximum 6 context files. Only the first 6 will be used.")
         context_files = context_files[:6]
 
+    exclude_3rd = st.checkbox(
+        "Exclude 3rd Shift from analysis",
+        value=True,
+        help="Check this to remove 3rd shift data from plant-level OEE, utilization, "
+             "and recommendations. Use the dedicated 3rd Shift Report tab for 3rd shift analysis.",
+    )
+
     # --- Analyze ---
     if oee_file is not None:
         if st.button("Analyze", type="primary", use_container_width=True):
@@ -166,7 +173,9 @@ with tab_analyze:
 
                     st.success(f"Analyzing {len(dates)} day(s): {', '.join(dates)}")
 
-                    results = analyze(hourly, shift_summary, overall, hour_avg, downtime)
+                    exclude = ["3rd Shift"] if exclude_3rd else None
+                    results = analyze(hourly, shift_summary, overall, hour_avg, downtime,
+                                      exclude_shifts=exclude)
 
                     output_name = f"{basename}{suffix}_{timestamp}.xlsx"
                     output_path = os.path.join(tmp_dir, output_name)

@@ -267,6 +267,8 @@ def consolidate(workbooks):
                 causes_df = shift_dt.get(shift_name, pd.DataFrame())
                 if len(causes_df) > 0:
                     r["Top Issue"] = str(causes_df.iloc[0, 0])
+                    r["Top Issue Min"] = _safe_float(
+                        causes_df.iloc[0, 2]) if len(causes_df.columns) > 2 else 0
                 all_shift_rows.append(r)
                 if "Date" in r and pd.notna(r["Date"]):
                     dates_seen.add(str(r["Date"]))
@@ -432,34 +434,35 @@ class EOSReport(FPDF):
         self.set_y(-8)
         self.set_font("Helvetica", "I", 7)
         self.set_text_color(*MID_GRAY)
-        super().cell(0, 4, _sanitize_text(f"Generated {self._generated}  |  Page {self.page_no()}/2  |  Numbers from the machine, not opinions"), align="C")
+        super().cell(0, 4, _sanitize_text(f"Generated {self._generated}  |  Numbers from the machine, not opinions"), align="C")
 
     # --- Helpers ---
-    def _section_header(self, text, y=None):
+    def _section_header(self, text, y=None, font_size=9, w=None):
         """Navy section divider."""
         if y is not None:
             self.set_y(y)
-        self.set_font("Helvetica", "B", 9)
+        self.set_font("Helvetica", "B", font_size)
         self.set_text_color(*NAVY)
         self.set_draw_color(*NAVY)
-        x = self.get_x()
-        w = self.epw
-        self.cell(w, 5, f"  {text}", border="B", new_x="LMARGIN", new_y="NEXT")
-        self.ln(1)
+        if w is None:
+            w = self.epw
+        self.cell(w, 4, f"  {text}", border="B", new_x="LMARGIN", new_y="NEXT")
+        self.ln(0.5)
 
-    def _table_header(self, widths, headers):
+    def _table_header(self, widths, headers, h=5, font_size=7):
         """Draw table header row."""
-        self.set_font("Helvetica", "B", 7)
+        self.set_font("Helvetica", "B", font_size)
         self.set_fill_color(*NAVY)
         self.set_text_color(*WHITE)
-        for w, h in zip(widths, headers):
-            self.cell(w, 5, f" {h}", border=1, fill=True)
+        for w, hdr in zip(widths, headers):
+            self.cell(w, h, f" {hdr}", border=1, fill=True)
         self.ln()
         self.set_text_color(*DARK_TEXT)
 
-    def _table_row(self, widths, values, highlight_col=None, highlight_color=None, fill=False):
+    def _table_row(self, widths, values, highlight_col=None, highlight_color=None,
+                   fill=False, h=4.5, font_size=7):
         """Draw a single data row."""
-        self.set_font("Helvetica", "", 7)
+        self.set_font("Helvetica", "", font_size)
         if fill:
             self.set_fill_color(*LIGHT_GRAY)
         for i, (w, v) in enumerate(zip(widths, values)):
@@ -467,7 +470,7 @@ class EOSReport(FPDF):
             if highlight_col is not None and i == highlight_col and highlight_color:
                 self.set_fill_color(*highlight_color)
                 do_fill = True
-            self.cell(w, 4.5, f" {v}", border=1, fill=do_fill)
+            self.cell(w, h, f" {v}", border=1, fill=do_fill)
             if highlight_col is not None and i == highlight_col and fill:
                 self.set_fill_color(*LIGHT_GRAY)
             elif highlight_col is not None and i == highlight_col:
@@ -475,27 +478,74 @@ class EOSReport(FPDF):
         self.ln()
 
     # ------------------------------------------------------------------
-    # Page 1: Scorecard
+    # Single-page report — adapts density to fit 1-6 files
     # ------------------------------------------------------------------
     def build_page1(self, data):
         self.add_page()
 
-        # === TITLE BAR ===
+        # --- Gather all data ---
+        kpis = data.get("kpis", {})
+        shift_rows = data.get("shift_grid", [])
+        daily_rows = data.get("daily_trend", [])
+        pareto = data.get("downtime_pareto", [])[:10]
+        narratives = data.get("shift_narratives", {})
+        ids_items = data.get("ids_items", [])
+
+        # --- Dynamic sizing based on data volume ---
+        n_shift = len(shift_rows)
+        n_daily = len(daily_rows)
+        n_pareto = len(pareto)
+        active_narr = [s for s in ["1st Shift", "2nd Shift", "3rd Shift"]
+                       if narratives.get(s)]
+        n_narr = len(active_narr)
+        n_ids = len(ids_items)
+
+        # Available column height (landscape letter = 215.9mm)
+        col_top = 33  # y where columns start (after title + KPIs)
+        col_bot = self.h - 10  # leave room for footer
+        col_h = col_bot - col_top
+
+        # Estimate fixed heights per column (section headers, gaps)
+        left_fixed = 5 + 5 + 2  # shift section hdr + narrative section hdr + gap
+        right_fixed = 5 + 5 + 5 + 4  # daily hdr + pareto hdr + IDS hdr + gaps
+
+        # IDS item height (compact)
+        ids_item_h = 10
+        narr_item_h = 7
+
+        left_avail = col_h - left_fixed - n_narr * narr_item_h
+        right_avail = col_h - right_fixed - n_ids * ids_item_h
+
+        # Row height: fit the more constrained column
+        rh_left = left_avail / max(n_shift, 1)
+        rh_right = right_avail / max(n_daily + n_pareto, 1)
+        row_h = min(rh_left, rh_right, 5.5)
+        row_h = max(row_h, 3.0)
+        row_h = round(row_h * 2) / 2  # round to 0.5mm
+
+        hdr_h = min(row_h + 0.5, 5.0)
+        font_tbl = 5.5 if row_h <= 3.0 else 6.0 if row_h <= 4.0 else 7.0
+        font_hdr = font_tbl + 0.5
+        font_sec = 7.5 if row_h <= 3.5 else 8.5
+
+        # Narrative character limit scales with available space
+        narr_chars = 150 if n_shift > 12 else 250 if n_shift > 6 else 350
+
+        # === TITLE BAR (compact) ===
         self.set_fill_color(*NAVY)
-        self.rect(self.l_margin, 8, self.epw, 12, style="F")
-        self.set_xy(self.l_margin + 2, 9)
-        self.set_font("Helvetica", "B", 14)
+        self.rect(self.l_margin, 8, self.epw, 10, style="F")
+        self.set_xy(self.l_margin + 2, 8.5)
+        self.set_font("Helvetica", "B", 12)
         self.set_text_color(*WHITE)
         self.cell(0, 5, "EOS Meeting Report — OEE Analysis")
-        self.set_font("Helvetica", "", 9)
-        self.set_xy(self.l_margin + 2, 14.5)
-        self.cell(0, 5, f"{data['date_range']}  |  {data['n_days']} day(s)  |  {data['n_files']} file(s) consolidated")
+        self.set_font("Helvetica", "", 8)
+        self.set_xy(self.l_margin + 2, 13)
+        self.cell(0, 5, f"{data['date_range']}  |  {data['n_days']} day(s)  |  {data['n_files']} file(s)")
 
         self.set_text_color(*DARK_TEXT)
-        self.set_y(24)
+        self.set_y(20)
 
-        # === KPI CARDS ===
-        kpis = data.get("kpis", {})
+        # === KPI CARDS (compact) ===
         card_kpis = [
             ("Overall OEE", kpis.get("Overall OEE", "N/A")),
             ("OEE Gap to 50%", kpis.get("OEE Gap to 50% Target", "N/A")),
@@ -511,112 +561,107 @@ class EOSReport(FPDF):
 
         for i, (label, value) in enumerate(card_kpis):
             x = x_start + i * card_w
-            # Card background
             self.set_fill_color(*LIGHT_GRAY)
-            self.rect(x + 0.5, y_kpi, card_w - 1, 14, style="F")
-            # Label
-            self.set_xy(x + 1, y_kpi + 1)
-            self.set_font("Helvetica", "", 6)
+            self.rect(x + 0.5, y_kpi, card_w - 1, 11, style="F")
+            self.set_xy(x + 1, y_kpi + 0.5)
+            self.set_font("Helvetica", "", 5.5)
             self.set_text_color(*MID_GRAY)
             self.cell(card_w - 2, 3, label, align="C")
-            # Value
-            self.set_xy(x + 1, y_kpi + 4.5)
-            self.set_font("Helvetica", "B", 9)
+            self.set_xy(x + 1, y_kpi + 3.5)
+            self.set_font("Helvetica", "B", 8)
             self.set_text_color(*NAVY)
-            # Truncate long values
             display_val = str(value)
             if len(display_val) > 22:
                 display_val = display_val[:20] + ".."
             self.cell(card_w - 2, 5, display_val, align="C")
 
         self.set_text_color(*DARK_TEXT)
-        self.set_y(y_kpi + 18)
+        self.set_y(y_kpi + 13)
 
-        # === LEFT COLUMN: Shift Performance Grid ===
-        col_left_w = self.epw * 0.58
-        col_right_w = self.epw * 0.42
+        # === TWO-COLUMN LAYOUT ===
+        col_left_w = self.epw * 0.55
+        col_right_w = self.epw * 0.45
         col_left_x = self.l_margin
         col_right_x = self.l_margin + col_left_w + 2
         y_cols = self.get_y()
 
-        # --- Shift Performance Grid ---
+        # --- LEFT: Shift Performance (merged with top issue + minutes) ---
         self.set_xy(col_left_x, y_cols)
-        self._section_header("Shift Performance")
+        self._section_header("Shift Performance", font_size=font_sec, w=col_left_w)
 
-        shift_rows = data.get("shift_grid", [])
         if shift_rows:
-            widths = [18, 16, 12, 16, 14, 14, 14, 36]
-            headers = ["Date", "Shift", "OEE %", "Cases", "CPH", "Tgt CPH", "% Tgt", "Top Issue"]
-            # Adjust widths to fit left column
+            widths = [16, 14, 11, 14, 12, 12, 32, 12]
+            headers = ["Date", "Shift", "OEE%", "Cases", "CPH", "%Tgt", "Top Issue", "Min"]
             total_w = sum(widths)
             scale = (col_left_w - 2) / total_w
             widths = [w * scale for w in widths]
 
-            self._table_header(widths, headers)
+            self._table_header(widths, headers, h=hdr_h, font_size=font_hdr)
 
             for idx, row in enumerate(shift_rows):
                 oee_val = _safe_float(row.get("OEE %", 0))
+                issue_min = _safe_float(row.get("Top Issue Min", 0))
                 values = [
                     str(row.get("Date", ""))[:10],
                     str(row.get("Shift", "")),
                     f"{oee_val:.1f}",
                     f"{_safe_float(row.get('Cases', 0)):,.0f}",
                     f"{_safe_float(row.get('CPH', 0)):,.0f}",
-                    f"{_safe_float(row.get('Target CPH', 0)):,.0f}",
                     f"{_safe_float(row.get('% of Target', 0)):.1f}",
-                    str(row.get("Top Issue", ""))[:30],
+                    str(row.get("Top Issue", ""))[:26],
+                    f"{issue_min:,.0f}" if issue_min else "",
                 ]
-                oee_color = _oee_color(oee_val)
                 self.set_x(col_left_x)
                 self._table_row(widths, values, highlight_col=2,
-                                highlight_color=oee_color, fill=(idx % 2 == 1))
+                                highlight_color=_oee_color(oee_val),
+                                fill=(idx % 2 == 1), h=row_h, font_size=font_tbl)
 
-        # --- Top Issues by Shift (below shift grid) ---
-        self.ln(2)
+        # --- LEFT: Shift Summaries ---
+        self.ln(1)
         self.set_x(col_left_x)
-        self._section_header("Top Issues by Shift")
+        self._section_header("Shift Summaries", font_size=font_sec, w=col_left_w)
 
-        loss_rows = data.get("loss_grid", [])
-        if loss_rows:
-            widths = [18, 16, 36, 14, 36, 14]
-            headers = ["Date", "Shift", "#1 Issue", "Min", "#2 Issue", "Min"]
-            total_w = sum(widths)
-            scale = (col_left_w - 2) / total_w
-            widths = [w * scale for w in widths]
+        for sname in ["1st Shift", "2nd Shift", "3rd Shift"]:
+            texts = narratives.get(sname, [])
+            if not texts:
+                continue
+            self.set_x(col_left_x)
+            self.set_font("Helvetica", "B", font_tbl)
+            self.set_text_color(*NAVY)
+            self.cell(16, 3.5, f"{sname}:", new_x="END")
+            self.set_font("Helvetica", "", font_tbl)
+            self.set_text_color(*DARK_TEXT)
+            narrative = texts[-1]
+            paragraphs = [p.strip() for p in narrative.split("\n\n") if p.strip()]
+            condensed = " | ".join(paragraphs[:2])
+            if len(condensed) > narr_chars:
+                condensed = condensed[:narr_chars - 3] + "..."
+            self.multi_cell(col_left_w - 18, 3, condensed)
+            self.ln(0.5)
 
-            self._table_header(widths, headers)
+        # --- LEFT: Source files ---
+        self.ln(1)
+        self.set_x(col_left_x)
+        self.set_font("Helvetica", "I", 5.5)
+        self.set_text_color(*MID_GRAY)
+        files_str = ", ".join(data.get("source_files", []))
+        self.cell(col_left_w, 3, f"Sources: {files_str}")
 
-            for idx, row in enumerate(loss_rows):
-                top1 = str(row.get("Top Issue", ""))[:28]
-                top1_min = _safe_float(row.get("Top Issue Min", 0))
-                top2 = str(row.get("Issue #2", ""))[:28]
-                top2_min = _safe_float(row.get("Issue #2 Min", 0))
-                values = [
-                    str(row.get("Date", ""))[:10],
-                    str(row.get("Shift", "")),
-                    top1,
-                    f"{top1_min:,.0f}" if top1 else "",
-                    top2,
-                    f"{top2_min:,.0f}" if top2 else "",
-                ]
-                self.set_x(col_left_x)
-                self._table_row(widths, values, fill=(idx % 2 == 1))
+        # === RIGHT COLUMN ===
 
-        # === RIGHT COLUMN: Daily OEE Trend + Mini Downtime ===
-        y_right = y_cols
-        self.set_xy(col_right_x, y_right)
-        self._section_header("Daily OEE Trend")
+        # --- RIGHT: Daily OEE Trend ---
+        self.set_xy(col_right_x, y_cols)
+        self._section_header("Daily OEE Trend", font_size=font_sec, w=col_right_w)
 
-        daily_rows = data.get("daily_trend", [])
         if daily_rows:
-            widths = [20, 16, 16, 16, 16, 16]
-            headers = ["Date", "OEE %", "Cases", "CPH", "Tgt CPH", "% Tgt"]
+            widths = [18, 14, 16, 14, 14, 14]
+            headers = ["Date", "OEE%", "Cases", "CPH", "Tgt CPH", "%Tgt"]
             total_w = sum(widths)
             scale = (col_right_w - 2) / total_w
             widths = [w * scale for w in widths]
 
             self.set_x(col_right_x)
-            self._table_header(widths, headers)
+            self._table_header(widths, headers, h=hdr_h, font_size=font_hdr)
 
             for idx, row in enumerate(daily_rows):
                 oee_val = _safe_float(row.get("OEE %", 0))
@@ -630,199 +675,74 @@ class EOSReport(FPDF):
                 ]
                 self.set_x(col_right_x)
                 self._table_row(widths, values, highlight_col=1,
-                                highlight_color=_oee_color(oee_val), fill=(idx % 2 == 1))
+                                highlight_color=_oee_color(oee_val),
+                                fill=(idx % 2 == 1), h=row_h, font_size=font_tbl)
 
-        # --- Quick Downtime Summary (right column, below daily trend) ---
-        self.ln(2)
+        # --- RIGHT: Top Downtime Causes ---
+        self.ln(1)
         self.set_x(col_right_x)
-        self._section_header("Top Downtime Causes")
+        self._section_header("Top Downtime Causes", font_size=font_sec, w=col_right_w)
 
-        pareto = data.get("downtime_pareto", [])
         if pareto:
-            widths = [40, 18, 14, 12]
-            headers = ["Cause", "Minutes", "Events", "% Total"]
+            widths = [38, 16, 13, 12]
+            headers = ["Cause", "Minutes", "Events", "% Tot"]
             total_w = sum(widths)
             scale = (col_right_w - 2) / total_w
             widths = [w * scale for w in widths]
 
             self.set_x(col_right_x)
-            self._table_header(widths, headers)
+            self._table_header(widths, headers, h=hdr_h, font_size=font_hdr)
 
-            for idx, item in enumerate(pareto[:7]):  # Top 7 on page 1
+            for idx, item in enumerate(pareto):
                 values = [
-                    str(item["Cause"])[:30],
+                    str(item["Cause"])[:28],
                     f"{item['Total Min']:,.0f}",
                     f"{item['Events']:,}",
                     f"{item['Pct']:.1f}%",
                 ]
                 self.set_x(col_right_x)
-                self._table_row(widths, values, fill=(idx % 2 == 1))
+                self._table_row(widths, values, fill=(idx % 2 == 1),
+                                h=row_h, font_size=font_tbl)
 
-    # ------------------------------------------------------------------
-    # Page 2: Root Cause & Actions
-    # ------------------------------------------------------------------
-    def build_page2(self, data):
-        self.add_page()
+        # --- RIGHT: IDS Action Items (compact) ---
+        self.ln(1)
+        self.set_x(col_right_x)
+        self._section_header("IDS — Action Items", font_size=font_sec, w=col_right_w)
 
-        # === TITLE BAR ===
-        self.set_fill_color(*NAVY)
-        self.rect(self.l_margin, 8, self.epw, 10, style="F")
-        self.set_xy(self.l_margin + 2, 9)
-        self.set_font("Helvetica", "B", 12)
-        self.set_text_color(*WHITE)
-        self.cell(0, 4, "Root Cause Analysis & Action Items")
-        self.set_font("Helvetica", "", 8)
-        self.set_xy(self.l_margin + 2, 13)
-        self.cell(0, 4, f"IDS (Identify / Discuss / Solve) — Data-driven priorities from {data['n_files']} analysis file(s)")
-
-        self.set_text_color(*DARK_TEXT)
-        self.set_y(22)
-
-        # === SHIFT NARRATIVES (condensed) ===
-        self._section_header("Shift Summaries — What Happened & Why")
-
-        narratives = data.get("shift_narratives", {})
-        for sname in ["1st Shift", "2nd Shift", "3rd Shift"]:
-            texts = narratives.get(sname, [])
-            if not texts:
-                continue
-
-            self.set_font("Helvetica", "B", 7.5)
-            self.set_text_color(*NAVY)
-            self.cell(20, 4, f"{sname}:", new_x="END")
-            self.set_font("Helvetica", "", 7)
-            self.set_text_color(*DARK_TEXT)
-
-            # Use the most recent narrative; truncate to ~2 lines
-            narrative = texts[-1]
-            # Take first two paragraphs (what happened + why)
-            paragraphs = [p.strip() for p in narrative.split("\n\n") if p.strip()]
-            condensed = " | ".join(paragraphs[:2])
-            if len(condensed) > 300:
-                condensed = condensed[:297] + "..."
-            self.multi_cell(self.epw - 20, 3.5, condensed)
-            self.ln(1)
-
-        self.ln(2)
-
-        # === IDS ITEMS — Top 3 prioritized actions ===
-        self._section_header("IDS — Top 3 Action Items")
-
-        ids_items = data.get("ids_items", [])
         if ids_items:
             for idx, item in enumerate(ids_items):
                 priority = item.get("Priority", idx + 1)
                 finding = str(item.get("Finding", ""))
                 the_work = str(item.get("The Work", ""))
-                steps = []
-                for s in range(1, 6):
-                    step = item.get(f"Step {s}", "")
-                    if step:
-                        steps.append(str(step))
 
-                # Priority badge
-                y_start = self.get_y()
+                self.set_x(col_right_x)
                 self.set_fill_color(*NAVY)
                 self.set_text_color(*WHITE)
-                self.set_font("Helvetica", "B", 10)
-                self.cell(8, 6, f" #{priority}", fill=True)
+                self.set_font("Helvetica", "B", 7)
+                self.cell(6, 4.5, f"#{priority}", fill=True)
 
-                # Finding (headline)
                 self.set_text_color(*NAVY)
-                self.set_font("Helvetica", "B", 8)
-                self.cell(self.epw - 10, 6, f"  {finding[:120]}")
+                self.set_font("Helvetica", "B", 6.5)
+                self.cell(col_right_w - 8, 4.5, f" {finding[:80]}")
                 self.ln()
 
-                # The Work (evidence)
+                self.set_x(col_right_x + 6)
                 self.set_text_color(*DARK_TEXT)
-                self.set_font("Helvetica", "", 7)
-                self.set_x(self.l_margin + 8)
-                work_text = the_work[:400] if len(the_work) > 400 else the_work
-                self.multi_cell(self.epw - 10, 3.5, work_text)
+                self.set_font("Helvetica", "", 5.5)
+                work_text = the_work[:200] if len(the_work) > 200 else the_work
+                self.multi_cell(col_right_w - 8, 3, work_text)
                 self.ln(0.5)
-
-                # Steps (compact — 2 columns)
-                if steps:
-                    self.set_font("Helvetica", "", 6.5)
-                    self.set_text_color(100, 100, 100)
-                    step_w = (self.epw - 10) / 2
-                    x_base = self.l_margin + 8
-
-                    for si in range(0, len(steps), 2):
-                        self.set_x(x_base)
-                        step_text = f"Step {si+1}: {steps[si][:80]}"
-                        self.cell(step_w, 3.5, step_text)
-                        if si + 1 < len(steps):
-                            step_text2 = f"Step {si+2}: {steps[si+1][:80]}"
-                            self.cell(step_w, 3.5, step_text2)
-                        self.ln()
-
-                self.ln(2)
-
-                # Draw separator line between items
-                if idx < len(ids_items) - 1:
-                    self.set_draw_color(*MID_GRAY)
-                    self.line(self.l_margin + 8, self.get_y() - 1,
-                              self.l_margin + self.epw, self.get_y() - 1)
         else:
-            self.set_font("Helvetica", "I", 8)
-            self.cell(0, 5, "No focus items found in the uploaded analysis files.")
+            self.set_x(col_right_x)
+            self.set_font("Helvetica", "I", 7)
+            self.cell(col_right_w, 4, "No focus items found.")
             self.ln()
 
-        # === ROOT CAUSE CHAIN (visual) ===
-        y_chain = max(self.get_y() + 4, 155)
-        self.set_y(y_chain)
-        self._section_header("Root Cause Traceability")
-
-        # Build chain from top IDS item + downtime pareto
-        pareto = data.get("downtime_pareto", [])
-        kpis = data.get("kpis", {})
-        oee_val = kpis.get("Overall OEE", "??%")
-        top_cause = pareto[0]["Cause"] if pareto else "Unknown"
-        top_cause_min = f"{pareto[0]['Total Min']:,.0f} min" if pareto else "?? min"
-
-        # Second-highest cause for context
-        second_cause = pareto[1]["Cause"][:25] if len(pareto) > 1 else ""
-        second_min = f"{pareto[1]['Total Min']:,.0f} min" if len(pareto) > 1 else ""
-
-        chain = [
-            (f"OEE: {oee_val}", NAVY),
-            (f"#1: {top_cause[:22]}", RED),
-            (f"Impact: {top_cause_min}", ORANGE),
-            (f"#2: {second_cause}", NAVY if second_cause else MID_GRAY),
-            ("Action: See IDS #1", GREEN),
-        ]
-
-        box_w = (self.epw - 20) / len(chain)
-        arrow_w = 4
-        x = self.l_margin + 2
-        y = self.get_y() + 1
-
-        for i, (text, color) in enumerate(chain):
-            # Box
-            self.set_fill_color(*color)
-            self.set_draw_color(*color)
-            self.rect(x, y, box_w - arrow_w, 10, style="F")
-            # Text
-            self.set_xy(x + 1, y + 1)
-            self.set_font("Helvetica", "B", 6.5)
-            self.set_text_color(*WHITE)
-            self.multi_cell(box_w - arrow_w - 2, 3.5, text, align="C")
-            # Arrow
-            if i < len(chain) - 1:
-                ax = x + box_w - arrow_w
-                self.set_font("Helvetica", "B", 14)
-                self.set_text_color(*color)
-                self.set_xy(ax, y + 1)
-                self.cell(arrow_w, 8, ">", align="C")
-            x += box_w
-
-        # === SOURCE FILES ===
-        self.set_y(y + 16)
-        self.set_font("Helvetica", "I", 6)
-        self.set_text_color(*MID_GRAY)
-        files_str = ", ".join(data.get("source_files", []))
-        self.cell(0, 3, f"Source files: {files_str}")
+    # ------------------------------------------------------------------
+    # Page 2: kept as no-op — all content fits on page 1
+    # ------------------------------------------------------------------
+    def build_page2(self, data):
+        pass
 
 
 # ---------------------------------------------------------------------------

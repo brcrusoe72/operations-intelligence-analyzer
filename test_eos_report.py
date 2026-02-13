@@ -348,11 +348,11 @@ class TestEOSReportPDF:
         output = pdf.output()
         assert len(output) > 0
 
-    def test_pdf_has_two_pages(self, mock_data):
+    def test_pdf_has_one_page(self, mock_data):
         pdf = EOSReport()
         pdf.build_page1(mock_data)
         pdf.build_page2(mock_data)
-        assert pdf.page_no() == 2
+        assert pdf.page_no() == 1
 
     def test_pdf_is_valid(self, mock_data, tmp_path):
         pdf = EOSReport()

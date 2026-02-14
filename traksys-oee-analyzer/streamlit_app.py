@@ -109,9 +109,11 @@ with tab_analyze:
                         all_hourly.append(h)
                         all_shift_summary.append(ss)
 
-                    # Merge OEE data
+                    # Merge OEE data (dedup overlapping date ranges across files)
                     hourly = pd.concat(all_hourly, ignore_index=True)
+                    hourly = hourly.drop_duplicates(subset=["date_str", "shift", "shift_hour"], keep="first")
                     shift_summary = pd.concat(all_shift_summary, ignore_index=True)
+                    shift_summary = shift_summary.drop_duplicates(subset=["shift_date", "shift"], keep="first")
 
                     # Rebuild overall (per-shift aggregate) from merged hourly
                     overall_rows = []

@@ -69,6 +69,20 @@ def _safe_float(val, default=0.0):
         return default
 
 
+def _safe_str(val, default=""):
+    """Convert to string, returning default for None/NaN."""
+    if val is None:
+        return default
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    s = str(val)
+    return default if s.lower() == "nan" else s
+
+
 # ---------------------------------------------------------------------------
 # Excel Reader — extract structured data from analysis workbooks
 # ---------------------------------------------------------------------------
@@ -557,7 +571,7 @@ class AnalysisReport(FPDF):
         # === SHIFT PERFORMANCE TABLE (full width) ===
         self._section_header("Shift Performance", font_size=FONT_SEC)
         if shift_rows:
-            widths = [22, 18, 12, 14, 20, 14, 14, 50, 16]
+            widths = [22, 18, 16, 14, 20, 14, 14, 46, 16]
             headers = ["Date", "Shift", "Product", "OEE%", "Cases", "CPH", "%Tgt", "Top Issue", "Min"]
             scale = self.epw / sum(widths)
             widths = [w * scale for w in widths]
@@ -571,12 +585,12 @@ class AnalysisReport(FPDF):
                 values = [
                     str(row.get("Date", ""))[:10],
                     str(row.get("Shift", "")),
-                    str(row.get("Product", ""))[:14],
+                    _safe_str(row.get("Product", ""))[:20],
                     f"{oee_val:.1f}",
                     f"{_safe_float(row.get('Cases', 0)):,.0f}",
                     f"{_safe_float(row.get('CPH', 0)):,.0f}",
                     f"{_safe_float(row.get('% of Target', 0)):.1f}",
-                    str(row.get("Top Issue", ""))[:36],
+                    _safe_str(row.get("Top Issue", ""))[:36],
                     f"{issue_min:,.0f}" if issue_min else "",
                 ]
                 self._table_row(widths, values, highlight_col=3,

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
-from shared import EXCLUDE_REASONS, EQUIPMENT_KEYWORDS, SHIFT_HOURS, classify_fault, get_target_cph
+from shared import EXCLUDE_REASONS, EQUIPMENT_KEYWORDS, SHIFT_HOURS, _PRODUCT_CODE_TO_PACK, classify_fault, get_target_cph
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1551,12 +1551,13 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
             s_target_cph = product_target_cph
         s_pct = s_cph / s_target_cph * 100 if s_target_cph > 0 else 0
 
-        # Product — most common product_code for this date+shift
+        # Product — most common product_code for this date+shift, shown as pack type
         s_product = ""
         if "product_code" in s_data.columns:
             mode = s_data["product_code"].mode()
-            if len(mode) > 0:
-                s_product = str(mode.iloc[0])
+            if len(mode) > 0 and not pd.isna(mode.iloc[0]):
+                raw = str(mode.iloc[0])
+                s_product = _PRODUCT_CODE_TO_PACK.get(raw, _PRODUCT_CODE_TO_PACK.get(raw.upper(), raw))
 
         # Top Issue — from events_df filtered to this date AND shift
         s_top_issue = ""
@@ -1572,7 +1573,8 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
                 if len(day_shift_ev) > 0:
                     cause_agg = day_shift_ev.groupby("reason")["duration_minutes"].sum()
                     top_cause = cause_agg.sort_values(ascending=False).head(1)
-                    s_top_issue = str(top_cause.index[0])
+                    if not pd.isna(top_cause.index[0]):
+                        s_top_issue = str(top_cause.index[0])
                     s_top_issue_min = round(top_cause.iloc[0], 0)
 
         comp_rows.append({

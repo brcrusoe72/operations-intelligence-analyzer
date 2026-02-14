@@ -15,7 +15,11 @@ import streamlit as st
 import tempfile
 import shutil
 import os
+import sys
 from datetime import datetime
+
+# Ensure sibling modules are importable when run from repo root (Streamlit Cloud)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 

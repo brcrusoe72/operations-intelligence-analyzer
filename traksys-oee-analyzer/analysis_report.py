@@ -424,6 +424,72 @@ def consolidate(workbooks):
 
 
 # ---------------------------------------------------------------------------
+# Fresh summary / action generators — always equipment-first, data-driven
+# ---------------------------------------------------------------------------
+def _build_fresh_summaries(shift_grid, pareto):
+    """Generate equipment-first shift summaries from consolidated data."""
+    summaries = {}
+    if not shift_grid:
+        return summaries
+    df = pd.DataFrame(shift_grid)
+    for shift_name in ["1st Shift", "2nd Shift", "3rd Shift"]:
+        sdf = df[df["Shift"] == shift_name]
+        if len(sdf) == 0:
+            continue
+        n_days = sdf["Date"].nunique()
+        avg_oee = _safe_float(sdf["OEE %"].mean())
+        total_cases = _safe_float(sdf["Cases"].sum())
+        avg_cph = _safe_float(sdf["CPH"].mean())
+        avg_pct = _safe_float(sdf["% of Target"].mean())
+
+        # Find this shift's #1 issue by total minutes
+        issue_df = sdf[sdf["Top Issue"].apply(lambda x: bool(_safe_str(x)))]
+        top_issue = ""
+        top_min = 0
+        agg = None
+        if len(issue_df) > 0:
+            agg = issue_df.groupby("Top Issue")["Top Issue Min"].sum().sort_values(ascending=False)
+            top_issue = _safe_str(agg.index[0])
+            top_min = _safe_float(agg.iloc[0])
+
+        # Paragraph 1: what happened
+        parts = [f"{shift_name} averaged {avg_oee:.1f}% OEE across {n_days} day(s), "
+                 f"producing {total_cases:,.0f} cases ({avg_cph:,.0f} CPH, "
+                 f"{avg_pct:.0f}% of target)."]
+
+        # Paragraph 2: lead with specific equipment issue
+        if top_issue:
+            parts.append(f"#1 issue: {top_issue} -- {top_min:,.0f} min total.")
+            # Add runner-up if exists
+            if agg is not None and len(agg) > 1:
+                r2 = _safe_str(agg.index[1])
+                r2_min = _safe_float(agg.iloc[1])
+                parts.append(f"Also: {r2} ({r2_min:,.0f} min).")
+
+        summaries[shift_name] = " ".join(parts)
+    return summaries
+
+
+def _build_fresh_actions(shift_grid, pareto):
+    """Generate data-driven action items from consolidated data."""
+    actions = []
+    for i, item in enumerate(pareto[:3]):
+        cause = _safe_str(item.get("Cause", ""))
+        total_min = _safe_float(item.get("Total Min", 0))
+        events = int(_safe_float(item.get("Events", 0)))
+        pct = _safe_float(item.get("Pct", 0))
+        if not cause:
+            continue
+        actions.append({
+            "Priority": i + 1,
+            "Finding": f"#{i+1} loss: {cause} -- {total_min:,.0f} min / {events} events ({pct:.1f}% of downtime)",
+            "The Work": f"Target 50% reduction in {cause}. Pull event logs, identify patterns by shift/time/product. "
+                        f"5-why the top events, implement countermeasures, track weekly.",
+        })
+    return actions
+
+
+# ---------------------------------------------------------------------------
 # PDF Builder
 # ---------------------------------------------------------------------------
 class AnalysisReport(FPDF):
@@ -651,35 +717,35 @@ class AnalysisReport(FPDF):
 
         self.ln(GAP)
 
-        # === SHIFT SUMMARIES ===
+        # === SHIFT SUMMARIES (fresh from consolidated data) ===
+        fresh_summaries = _build_fresh_summaries(shift_rows, pareto)
         active_shifts = [s for s in ["1st Shift", "2nd Shift", "3rd Shift"]
-                         if narratives.get(s)]
+                         if fresh_summaries.get(s) or narratives.get(s)]
         if active_shifts:
             self._ensure_space(15)
             self._section_header("Shift Summaries", font_size=FONT_SEC)
             for sname in active_shifts:
-                texts = narratives[sname]
                 self._ensure_space(10)
                 self.set_font("Helvetica", "B", FONT_TBL)
                 self.set_text_color(*NAVY)
                 self.cell(20, 4, f"{sname}:", new_x="END")
                 self.set_font("Helvetica", "", FONT_TBL)
                 self.set_text_color(*DARK_TEXT)
-                narrative = texts[-1]
-                paragraphs = [p.strip() for p in narrative.split("\n\n") if p.strip()]
-                condensed = " | ".join(paragraphs[:2])
-                if len(condensed) > 500:
-                    condensed = condensed[:497] + "..."
-                self.multi_cell(self.epw - 22, 3.5, condensed)
+                summary = fresh_summaries.get(sname, "")
+                if not summary and narratives.get(sname):
+                    summary = narratives[sname][-1]
+                self.multi_cell(self.epw - 22, 3.5, summary)
                 self.ln(1)
 
         self.ln(GAP)
 
-        # === IDS ACTION ITEMS ===
-        if ids_items:
+        # === IDS ACTION ITEMS (fresh from consolidated data) ===
+        fresh_actions = _build_fresh_actions(shift_rows, pareto)
+        display_actions = fresh_actions if fresh_actions else ids_items
+        if display_actions:
             self._ensure_space(15)
             self._section_header("IDS -- Action Items", font_size=FONT_SEC)
-            for idx, item in enumerate(ids_items):
+            for idx, item in enumerate(display_actions):
                 self._ensure_space(12)
                 priority = item.get("Priority", idx + 1)
                 finding = str(item.get("Finding", ""))

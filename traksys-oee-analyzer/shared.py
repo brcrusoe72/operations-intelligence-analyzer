@@ -9,6 +9,11 @@ and shift_report.py.
 import pandas as pd
 
 # ---------------------------------------------------------------------------
+# Shift duration — always 8 hours at this plant
+# ---------------------------------------------------------------------------
+SHIFT_HOURS = 8.0
+
+# ---------------------------------------------------------------------------
 # Exclude from actionable downtime analysis
 # ---------------------------------------------------------------------------
 EXCLUDE_REASONS = {"Not Scheduled", "Break-Lunch", "Lunch (Comida)", "Meetings"}

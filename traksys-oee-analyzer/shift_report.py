@@ -24,7 +24,7 @@ from analyze import (
     _correlate_dead_hours_with_events, load_oee_data,
 )
 from shared import (
-    EXCLUDE_REASONS, classify_fault, normalize_product,
+    EXCLUDE_REASONS, SHIFT_HOURS, classify_fault, normalize_product,
     PRODUCT_RATED_SPEED, PRODUCT_PACK_TYPE, PRODUCT_TARGET, PRODUCT_PACK,
     IS_TRAYED,
     extract_equipment_mentions, summarize_issues, classify_support,
@@ -585,7 +585,8 @@ def build_report(hourly, shift_summary, overall, hour_avg, downtime, product_dat
     n_days = ht["date_str"].nunique()
 
     plant_avail, plant_perf, plant_qual, plant_oee = _aggregate_oee(hourly)
-    plant_cph = hourly["total_cases"].sum() / hourly["total_hours"].sum()
+    n_shift_days_plant = hourly.groupby(["date_str", "shift"]).ngroups
+    plant_cph = hourly["total_cases"].sum() / (n_shift_days_plant * SHIFT_HOURS) if n_shift_days_plant > 0 else 0
 
     st_avail, st_perf, st_qual, st_oee = _aggregate_oee(ht)
     st_cph_row = overall[overall["shift"] == target_shift]

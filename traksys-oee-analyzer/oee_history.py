@@ -20,6 +20,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from shared import SHIFT_HOURS
+
 _DIR = os.path.dirname(__file__)
 HISTORY_FILE = os.path.join(_DIR, "history.jsonl")
 TRENDS_FILE = os.path.join(_DIR, "plant_trends.json")
@@ -52,7 +54,8 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
     n_days = hourly["date_str"].nunique()
     total_cases = float(hourly["total_cases"].sum())
     total_hours = float(hourly["total_hours"].sum())
-    avg_cph = total_cases / total_hours if total_hours > 0 else 0.0
+    n_shift_days = hourly.groupby(["date_str", "shift"]).ngroups
+    avg_cph = total_cases / (n_shift_days * SHIFT_HOURS) if n_shift_days > 0 else 0.0
 
     # Extract KPIs from Plant Summary (new shift-centric structure)
     # or fall back to Executive Summary (legacy structure)

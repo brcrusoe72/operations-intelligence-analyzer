@@ -29,6 +29,7 @@ from oee_history import save_run, load_trends, load_hourly_history, load_shift_d
 from analysis_report import generate_analysis_report_bytes
 from shift_report import detect_shifts, build_report, write_report as shift_write_report, load_data as shift_load_data, _shift_label, _detect_shift
 from analyze import _aggregate_oee
+from shared import SHIFT_HOURS
 
 st.set_page_config(
     page_title="Traksys OEE Analyzer",
@@ -125,7 +126,7 @@ with tab_analyze:
                             "bad_cases": float(sh["bad_cases"].sum()) if "bad_cases" in sh.columns else 0,
                             "total_cases": float(sh["total_cases"].sum()),
                             "oee_pct": oee,
-                            "cases_per_hour": float(sh["total_cases"].sum()) / max(total_hrs, 0.01),
+                            "cases_per_hour": float(sh["total_cases"].sum()) / (sh["date_str"].nunique() * SHIFT_HOURS) if sh["date_str"].nunique() > 0 else 0,
                         })
                     overall = pd.DataFrame(overall_rows)
 
@@ -134,11 +135,12 @@ with tab_analyze:
                     for (shift, hour), grp in hourly.groupby(["shift", "shift_hour"]):
                         _a, _p, _q, oee = _aggregate_oee(grp)
                         total_hrs = float(grp["total_hours"].sum())
+                        n_hr_days = grp["date_str"].nunique()
                         hour_avg_rows.append({
                             "shift": shift, "shift_hour": hour,
                             "oee_pct": oee,
                             "availability": _a, "performance": _p,
-                            "cases_per_hour": float(grp["total_cases"].sum()) / max(total_hrs, 0.01),
+                            "cases_per_hour": float(grp["total_cases"].sum()) / max(n_hr_days, 1),
                             "total_hours": total_hrs,
                         })
                     hour_avg = pd.DataFrame(hour_avg_rows)

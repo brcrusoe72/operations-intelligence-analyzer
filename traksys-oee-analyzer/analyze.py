@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
-from shared import EXCLUDE_REASONS, EQUIPMENT_KEYWORDS, classify_fault, get_target_cph
+from shared import EXCLUDE_REASONS, EQUIPMENT_KEYWORDS, SHIFT_HOURS, classify_fault, get_target_cph
 
 # ---------------------------------------------------------------------------
 # Config
@@ -680,8 +680,8 @@ def build_shift_deep_dive(shift_name, hourly, shift_summary, hour_avg, overall, 
     shift_avail, shift_perf, shift_qual, shift_oee = _aggregate_oee(sh)
     shift_cases = sh["total_cases"].sum()
     shift_hours = sh["total_hours"].sum()
-    shift_cph = ov["cases_per_hour"].values[0] if len(ov) > 0 else (shift_cases / shift_hours if shift_hours > 0 else 0)
     n_days = sh["date_str"].nunique()
+    shift_cph = shift_cases / (n_days * SHIFT_HOURS) if n_days > 0 else 0
 
     oee_vs_plant = shift_oee - plant_avg_oee
     oee_indicator = "above" if oee_vs_plant > 0 else "below"
@@ -820,7 +820,8 @@ def build_shift_deep_dive(shift_name, hourly, shift_summary, hour_avg, overall, 
         _, _, _, day_oee = _aggregate_oee(day_data)
         day_total_cases = day_data["total_cases"].sum()
         day_total_hours = day_data["total_hours"].sum()
-        day_cph = day_total_cases / day_total_hours if day_total_hours > 0 else 0
+        n_dow_days = day_data["date_str"].nunique()
+        day_cph = day_total_cases / (n_dow_days * SHIFT_HOURS) if n_dow_days > 0 else 0
         n_hours = len(day_data)
         sh_dow_rows.append({"day_of_week": day_name, "avg_oee": day_oee,
                             "avg_cph": day_cph, "n_hours": n_hours})
@@ -982,8 +983,8 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
     shift_avail, shift_perf, shift_qual, shift_oee = _aggregate_oee(sh)
     shift_cases = sh["total_cases"].sum()
     shift_hours = sh["total_hours"].sum()
-    shift_cph = shift_cases / shift_hours if shift_hours > 0 else 0
     n_days = sh["date_str"].nunique()
+    shift_cph = shift_cases / (n_days * SHIFT_HOURS) if n_days > 0 else 0
 
     # Utilization
     util_pct, prod_hours, sched_hours, dead_count = _compute_utilization(sh)
@@ -993,13 +994,13 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
         sh["_tgt_cph"] = sh["product_code"].apply(get_target_cph)
         benchmark_cph = sh[sh["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(sh[sh["total_hours"] >= 0.5]) > 0 else 0
         sh["_tgt_cph"] = sh["_tgt_cph"].fillna(benchmark_cph)
-        target_cases_total = (sh["_tgt_cph"] * sh["total_hours"]).sum()
-        target_cph_avg = target_cases_total / shift_hours if shift_hours > 0 else benchmark_cph
+        target_cph_avg = (sh["_tgt_cph"] * sh["total_hours"]).sum() / shift_hours if shift_hours > 0 else benchmark_cph
+        target_cases_total = target_cph_avg * n_days * SHIFT_HOURS
         sh.drop(columns=["_tgt_cph"], inplace=True, errors="ignore")
     else:
         benchmark_cph = sh[sh["total_hours"] >= 0.5]["cases_per_hour"].quantile(0.90) if len(sh[sh["total_hours"] >= 0.5]) > 0 else 0
-        target_cases_total = benchmark_cph * shift_hours
         target_cph_avg = benchmark_cph
+        target_cases_total = benchmark_cph * n_days * SHIFT_HOURS
 
     pct_of_target = shift_cases / target_cases_total * 100 if target_cases_total > 0 else 0
     cases_gap = target_cases_total - shift_cases
@@ -1025,7 +1026,7 @@ def _compute_shift_data(shift_name, hourly, shift_summary, overall, downtime,
         da, dp, dq, doee = _aggregate_oee(d_data)
         d_cases = d_data["total_cases"].sum()
         d_hours = d_data["total_hours"].sum()
-        d_cph = d_cases / d_hours if d_hours > 0 else 0
+        d_cph = d_cases / SHIFT_HOURS
         d_util, d_prod, d_sched, d_dead = _compute_utilization(d_data)
         # Product target for this day
         if "product_code" in d_data.columns:
@@ -1489,7 +1490,8 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
     """
     total_cases = hourly["total_cases"].sum()
     total_hours = hourly["total_hours"].sum()
-    avg_cph = total_cases / total_hours if total_hours > 0 else 0
+    n_shift_days = hourly.groupby(["date_str", "shift"]).ngroups
+    avg_cph = total_cases / (n_shift_days * SHIFT_HOURS) if n_shift_days > 0 else 0
     avg_avail, avg_perf, avg_qual, avg_oee = _aggregate_oee(hourly)
     util_pct, prod_hours, sched_hours, dead_count = _compute_utilization(hourly)
     n_days = hourly["date_str"].nunique()
@@ -1502,11 +1504,11 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
         hourly_cp = hourly.copy()
         hourly_cp["_tgt"] = hourly_cp["product_code"].apply(get_target_cph)
         hourly_cp["_tgt"] = hourly_cp["_tgt"].fillna(benchmark_cph)
-        product_target_total = (hourly_cp["_tgt"] * hourly_cp["total_hours"]).sum()
-        product_target_cph = product_target_total / total_hours if total_hours > 0 else benchmark_cph
+        product_target_cph = (hourly_cp["_tgt"] * hourly_cp["total_hours"]).sum() / total_hours if total_hours > 0 else benchmark_cph
+        product_target_total = product_target_cph * n_shift_days * SHIFT_HOURS
     else:
-        product_target_total = benchmark_cph * total_hours
         product_target_cph = benchmark_cph
+        product_target_total = benchmark_cph * n_shift_days * SHIFT_HOURS
 
     has_downtime = downtime is not None and len(downtime.get("reasons_df", [])) > 0
     top_cause_str = ""
@@ -1537,7 +1539,7 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
         sa, sp, sq, soee = _aggregate_oee(s_data)
         s_cases = s_data["total_cases"].sum()
         s_hours = s_data["total_hours"].sum()
-        s_cph = s_cases / s_hours if s_hours > 0 else 0
+        s_cph = s_cases / SHIFT_HOURS
         # Product target for this shift-day
         if "product_code" in s_data.columns:
             s_data_cp = s_data.copy()
@@ -1615,6 +1617,7 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
     loss_df = pd.DataFrame(loss_rows).sort_values(["Date", "Shift"]).reset_index(drop=True)
 
     # --- Daily Trend ---
+    # Compute weighted-average target CPH per row (inflation cancels in ratio)
     if "product_code" in hourly.columns:
         hourly_cp2 = hourly.copy()
         hourly_cp2["_tgt"] = hourly_cp2["product_code"].apply(get_target_cph)
@@ -1631,6 +1634,13 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
              target_cases=("_tgt_cases", "sum"))
         .reset_index()
     )
+    # Correct hours: n_shifts_per_day × SHIFT_HOURS
+    n_shifts_daily = hourly.groupby("date_str")["shift"].nunique().rename("n_shifts")
+    daily = daily.merge(n_shifts_daily, on="date_str", how="left")
+    daily["actual_hours"] = daily["n_shifts"] * SHIFT_HOURS
+    # Fix target_cases: weighted-avg target CPH × actual hours
+    daily["target_cph"] = (daily["target_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0)
+    daily["target_cases"] = daily["target_cph"] * daily["actual_hours"]
     # Weighted OEE
     shift_summary_cp = shift_summary.copy()
     shift_summary_cp["_w"] = shift_summary_cp["oee_pct"] * shift_summary_cp["total_hours"]
@@ -1641,12 +1651,12 @@ def _build_plant_summary(hourly, shift_summary, overall, downtime):
     )
     daily_oee["avg_oee"] = (daily_oee["_w"] / daily_oee["_hrs"].replace(0, np.nan)).fillna(0).round(1)
     daily = daily.merge(daily_oee[["date_str", "avg_oee"]], on="date_str", how="left")
-    daily["cph"] = (daily["total_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
-    daily["target_cph"] = (daily["target_cases"] / daily["total_hours"].replace(0, np.nan)).fillna(0).round(0)
+    daily["cph"] = (daily["total_cases"] / daily["actual_hours"].replace(0, np.nan)).fillna(0).round(0)
+    daily["target_cph"] = daily["target_cph"].round(0)
     daily["pct_target"] = (daily["total_cases"] / daily["target_cases"].replace(0, np.nan) * 100).fillna(0).round(1)
     daily = daily.sort_values("date_str")
 
-    daily_trend_df = daily[["date_str", "total_hours", "cph", "target_cph",
+    daily_trend_df = daily[["date_str", "actual_hours", "cph", "target_cph",
                             "total_cases", "target_cases", "pct_target", "avg_oee"]].copy()
     daily_trend_df.columns = ["Date", "Sched Hours", "Cases/Hr", "Target CPH",
                               "Actual Cases", "Target Cases", "% of Target", "OEE %"]
@@ -1680,7 +1690,8 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
     # === CORE METRICS ===
     total_cases = hourly["total_cases"].sum()
     total_hours = hourly["total_hours"].sum()
-    avg_cph = total_cases / total_hours if total_hours > 0 else 0
+    n_shift_days = hourly.groupby(["date_str", "shift"]).ngroups
+    avg_cph = total_cases / (n_shift_days * SHIFT_HOURS) if n_shift_days > 0 else 0
     avg_avail, avg_perf, avg_qual, avg_oee = _aggregate_oee(hourly)
 
     good_hours = hourly[hourly["total_hours"] >= 0.5]
@@ -1760,7 +1771,8 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None):
 
     OEE_TARGET = 50.0  # Plant target OEE %
     oee_gap_to_target = OEE_TARGET - avg_oee
-    target_cases_per_day = target_cph * (total_hours / n_days)
+    avg_shifts_per_day = hourly.groupby("date_str")["shift"].nunique().mean()
+    target_cases_per_day = target_cph * avg_shifts_per_day * SHIFT_HOURS
     cases_at_target_oee = total_cases / (avg_oee / 100) * (OEE_TARGET / 100) if avg_oee > 0 else 0
     cases_gained_at_target = cases_at_target_oee - total_cases
 

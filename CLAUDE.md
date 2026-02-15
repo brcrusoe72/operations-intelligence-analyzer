@@ -54,7 +54,7 @@ Input (Excel/JSON) → Parsing → Analysis Engine → Reporting (Excel/PDF/Web)
 
 - **`third_shift_targets.py`** — Weekly target tracker with email summary generation. Product-aware targets from plant standards.
 
-- **`streamlit_app.py`** — Web interface with 4 tabs: Analyze, Shift Deep Dive, Analysis Report, Plant History. Deployed on Streamlit Cloud.
+- **`streamlit_app.py`** — Single-page web interface for OEE analysis. Upload files, get Excel/PDF output. Deployed on Streamlit Cloud.
 
 ### Key Design Patterns
 

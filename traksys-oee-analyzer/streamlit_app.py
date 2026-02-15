@@ -73,6 +73,77 @@ output_format = st.radio(
     help="Excel gives you the full multi-sheet workbook. PDF gives a 1-page summary report.",
 )
 
+def _build_overall(hourly):
+    """Build per-shift aggregate from hourly data."""
+    rows = []
+    for shift_name in hourly["shift"].unique():
+        sh = hourly[hourly["shift"] == shift_name]
+        _a, _p, _q, oee = _aggregate_oee(sh)
+        total_hrs = float(sh["total_hours"].sum())
+        rows.append({
+            "shift": shift_name,
+            "total_hours": total_hrs,
+            "good_cases": float(sh["good_cases"].sum()) if "good_cases" in sh.columns else 0,
+            "bad_cases": float(sh["bad_cases"].sum()) if "bad_cases" in sh.columns else 0,
+            "total_cases": float(sh["total_cases"].sum()),
+            "oee_pct": oee,
+            "cases_per_hour": float(sh["total_cases"].sum()) / (sh["date_str"].nunique() * SHIFT_HOURS) if sh["date_str"].nunique() > 0 else 0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_hour_avg(hourly):
+    """Build per-shift-hour aggregate from hourly data."""
+    rows = []
+    for (shift, hour), grp in hourly.groupby(["shift", "shift_hour"]):
+        _a, _p, _q, oee = _aggregate_oee(grp)
+        total_hrs = float(grp["total_hours"].sum())
+        n_hr_days = grp["date_str"].nunique()
+        rows.append({
+            "shift": shift, "shift_hour": hour,
+            "oee_pct": oee,
+            "availability": _a, "performance": _p,
+            "cases_per_hour": float(grp["total_cases"].sum()) / max(n_hr_days, 1),
+            "total_hours": total_hrs,
+        })
+    return pd.DataFrame(rows)
+
+
+def _merge_downtime_dicts(dt_list):
+    """Merge multiple downtime dicts into one, re-aggregating reasons."""
+    if not dt_list:
+        return None
+    merged = dt_list[0].copy()
+    for extra in dt_list[1:]:
+        merged["events_df"] = pd.concat(
+            [merged["events_df"], extra["events_df"]], ignore_index=True)
+        merged["reasons_df"] = pd.concat(
+            [merged["reasons_df"], extra["reasons_df"]], ignore_index=True)
+        sr_extra = extra.get("shift_reasons_df", pd.DataFrame())
+        if len(sr_extra) > 0:
+            merged["shift_reasons_df"] = pd.concat(
+                [merged.get("shift_reasons_df", pd.DataFrame()), sr_extra],
+                ignore_index=True)
+    # Re-aggregate reasons
+    if len(merged["reasons_df"]) > 0:
+        merged["reasons_df"] = (
+            merged["reasons_df"]
+            .groupby("reason", as_index=False)
+            .agg({"total_minutes": "sum", "total_occurrences": "sum", "total_hours": "sum"})
+            .sort_values("total_minutes", ascending=False)
+            .reset_index(drop=True)
+        )
+    sr = merged.get("shift_reasons_df", pd.DataFrame())
+    if len(sr) > 0:
+        merged["shift_reasons_df"] = (
+            sr.groupby(["shift", "reason"], as_index=False)
+            .agg({"total_minutes": "sum", "count": "sum"})
+            .sort_values(["shift", "total_minutes"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+    return merged
+
+
 # --- Analyze ---
 if oee_files:
     if len(oee_files) > 1:
@@ -95,101 +166,53 @@ if oee_files:
                         h, ss, _ov, _ha = parse_oee_period_detail(oee_path)
                     else:
                         h, ss, _ov, _ha = load_oee_data(oee_path)
+                        # Ensure line column exists for old-format files
+                        if "line" not in h.columns:
+                            h["line"] = "All"
                     all_hourly.append(h)
                     all_shift_summary.append(ss)
 
-                # Merge OEE data (dedup overlapping date ranges across files)
+                # Merge OEE data (dedup overlapping date ranges per line)
                 hourly = pd.concat(all_hourly, ignore_index=True)
-                hourly = hourly.drop_duplicates(subset=["date_str", "shift", "shift_hour"], keep="first")
+                if "line" not in hourly.columns:
+                    hourly["line"] = "All"
+                hourly["line"] = hourly["line"].fillna("All")
+                hourly = hourly.drop_duplicates(
+                    subset=["date_str", "shift", "shift_hour", "line"], keep="first")
                 shift_summary = pd.concat(all_shift_summary, ignore_index=True)
-                shift_summary = shift_summary.drop_duplicates(subset=["shift_date", "shift"], keep="first")
+                shift_summary = shift_summary.drop_duplicates(
+                    subset=["shift_date", "shift"], keep="first")
 
-                # Rebuild overall (per-shift aggregate) from merged hourly
-                overall_rows = []
-                for shift_name in hourly["shift"].unique():
-                    sh = hourly[hourly["shift"] == shift_name]
-                    _a, _p, _q, oee = _aggregate_oee(sh)
-                    total_hrs = float(sh["total_hours"].sum())
-                    overall_rows.append({
-                        "shift": shift_name,
-                        "total_hours": total_hrs,
-                        "good_cases": float(sh["good_cases"].sum()) if "good_cases" in sh.columns else 0,
-                        "bad_cases": float(sh["bad_cases"].sum()) if "bad_cases" in sh.columns else 0,
-                        "total_cases": float(sh["total_cases"].sum()),
-                        "oee_pct": oee,
-                        "cases_per_hour": float(sh["total_cases"].sum()) / (sh["date_str"].nunique() * SHIFT_HOURS) if sh["date_str"].nunique() > 0 else 0,
-                    })
-                overall = pd.DataFrame(overall_rows)
-
-                # Rebuild hour_avg (per-shift-hour aggregate) from merged hourly
-                hour_avg_rows = []
-                for (shift, hour), grp in hourly.groupby(["shift", "shift_hour"]):
-                    _a, _p, _q, oee = _aggregate_oee(grp)
-                    total_hrs = float(grp["total_hours"].sum())
-                    n_hr_days = grp["date_str"].nunique()
-                    hour_avg_rows.append({
-                        "shift": shift, "shift_hour": hour,
-                        "oee_pct": oee,
-                        "availability": _a, "performance": _p,
-                        "cases_per_hour": float(grp["total_cases"].sum()) / max(n_hr_days, 1),
-                        "total_hours": total_hrs,
-                    })
-                hour_avg = pd.DataFrame(hour_avg_rows)
-
-                # Load all downtime / event data files
-                downtime = None
+                # Load all downtime / event data files, tagged by line
+                # dt_by_line: {line_name: [list of downtime dicts]}
+                dt_by_line = {}
                 if downtime_files:
                     from parse_passdown import parse_passdown
-                    dt_list = []
                     for dt_file in downtime_files:
                         dt_path = os.path.join(tmp_dir, dt_file.name)
                         with open(dt_path, "wb") as f:
                             f.write(dt_file.getbuffer())
                         try:
                             if dt_file.name.lower().endswith(".json"):
-                                dt_list.append(load_downtime_data(dt_path))
+                                dt_data = load_downtime_data(dt_path)
+                                line_key = dt_data.get("line") or "All"
+                                dt_by_line.setdefault(line_key, []).append(dt_data)
                             else:
                                 dt_type = detect_file_type(dt_path)
                                 if dt_type == "event_summary":
-                                    st.info(f"Detected: {dt_file.name} — Event Summary")
-                                    dt_list.append(parse_event_summary(dt_path))
+                                    dt_data = parse_event_summary(dt_path)
+                                    line_key = dt_data.get("line") or "All"
+                                    st.info(f"Detected: {dt_file.name} — Event Summary ({line_key})")
+                                    dt_by_line.setdefault(line_key, []).append(dt_data)
                                 elif dt_type == "passdown":
                                     st.info(f"Detected: {dt_file.name} — Shift Passdown")
-                                    dt_list.append(parse_passdown(dt_path))
+                                    dt_data = parse_passdown(dt_path)
+                                    line_key = dt_data.get("line") or "All"
+                                    dt_by_line.setdefault(line_key, []).append(dt_data)
                                 else:
                                     st.warning(f"Unrecognized downtime format: {dt_file.name}")
                         except Exception as e:
                             st.warning(f"Could not load {dt_file.name}: {e}")
-
-                    if dt_list:
-                        downtime = dt_list[0]
-                        for extra in dt_list[1:]:
-                            downtime["events_df"] = pd.concat(
-                                [downtime["events_df"], extra["events_df"]], ignore_index=True)
-                            downtime["reasons_df"] = pd.concat(
-                                [downtime["reasons_df"], extra["reasons_df"]], ignore_index=True)
-                            sr_extra = extra.get("shift_reasons_df", pd.DataFrame())
-                            if len(sr_extra) > 0:
-                                downtime["shift_reasons_df"] = pd.concat(
-                                    [downtime.get("shift_reasons_df", pd.DataFrame()), sr_extra],
-                                    ignore_index=True)
-                        # Re-aggregate reasons after merging
-                        if len(downtime["reasons_df"]) > 0:
-                            downtime["reasons_df"] = (
-                                downtime["reasons_df"]
-                                .groupby("reason", as_index=False)
-                                .agg({"total_minutes": "sum", "total_occurrences": "sum", "total_hours": "sum"})
-                                .sort_values("total_minutes", ascending=False)
-                                .reset_index(drop=True)
-                            )
-                        sr = downtime.get("shift_reasons_df", pd.DataFrame())
-                        if len(sr) > 0:
-                            downtime["shift_reasons_df"] = (
-                                sr.groupby(["shift", "reason"], as_index=False)
-                                .agg({"total_minutes": "sum", "count": "sum"})
-                                .sort_values(["shift", "total_minutes"], ascending=[True, False])
-                                .reset_index(drop=True)
-                            )
 
                 # Process context files (photos + additional Excel)
                 context_photos = []
@@ -206,111 +229,153 @@ if oee_files:
                             try:
                                 if detect_passdown(cf_path):
                                     extra = parse_passdown(cf_path)
-                                    if downtime is None:
-                                        downtime = extra
-                                        st.info(f"Context: {cf.name} — Shift Passdown ({len(extra['events_df'])} events)")
-                                    else:
-                                        # Merge events into existing downtime
-                                        import pandas as _pd
-                                        downtime["events_df"] = _pd.concat(
-                                            [downtime["events_df"], extra["events_df"]], ignore_index=True)
-                                        downtime["reasons_df"] = _pd.concat(
-                                            [downtime["reasons_df"], extra["reasons_df"]], ignore_index=True)
-                                        if len(extra.get("shift_reasons_df", _pd.DataFrame())) > 0:
-                                            downtime["shift_reasons_df"] = _pd.concat(
-                                                [downtime["shift_reasons_df"], extra["shift_reasons_df"]],
-                                                ignore_index=True)
-                                        st.info(f"Context: {cf.name} — merged {len(extra['events_df'])} passdown events")
+                                    line_key = extra.get("line") or "All"
+                                    dt_by_line.setdefault(line_key, []).append(extra)
+                                    st.info(f"Context: {cf.name} — Shift Passdown ({len(extra['events_df'])} events)")
                                 else:
                                     st.info(f"Context: {cf.name} — uploaded (not a recognized format)")
                             except Exception as e:
                                 st.warning(f"Could not parse {cf.name}: {e}")
 
-                # Build output filename
+                # Determine lines present in the data
+                lines = sorted(hourly["line"].unique())
+                multi_line = len(lines) > 1 or (len(lines) == 1 and lines[0] != "All")
+
                 dates = sorted(hourly["date_str"].unique())
-                basename = os.path.splitext(oee_files[0].name)[0]
-                if len(oee_files) > 1:
-                    basename += f"_+{len(oee_files) - 1}"
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                suffix = "_FULL_ANALYSIS" if downtime else "_ANALYSIS"
-
-                st.success(f"Analyzing {len(dates)} day(s): {', '.join(dates)}")
-
-                results = analyze(hourly, shift_summary, overall, hour_avg, downtime)
-
-                output_name = f"{basename}{suffix}_{timestamp}.xlsx"
-                output_path = os.path.join(tmp_dir, output_name)
-                write_excel(results, output_path)
-
                 want_excel = output_format in ("Excel (.xlsx)", "Both")
                 want_pdf = output_format in ("PDF Report (.pdf)", "Both")
 
-                if want_excel:
-                    with open(output_path, "rb") as f:
-                        excel_bytes = f.read()
-                    st.download_button(
-                        label=f"Download {output_name}",
-                        data=excel_bytes,
-                        file_name=output_name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="analyze_excel_dl",
-                    )
+                if multi_line:
+                    st.success(f"Analyzing {len(dates)} day(s) across {len(lines)} lines: {', '.join(lines)}")
+                else:
+                    st.success(f"Analyzing {len(dates)} day(s): {', '.join(dates)}")
 
-                if want_pdf:
-                    try:
-                        from analysis_report import generate_analysis_report_bytes
-                        pdf_bytes, _report_data = generate_analysis_report_bytes([output_path])
-                        if isinstance(pdf_bytes, bytearray):
-                            pdf_bytes = bytes(pdf_bytes)
-                        pdf_name = f"{basename}{suffix}_{timestamp}.pdf"
-                        st.download_button(
-                            label=f"Download {pdf_name}",
-                            data=pdf_bytes,
-                            file_name=pdf_name,
-                            mime="application/pdf",
-                            use_container_width=True,
-                            key="analyze_pdf_dl",
+                # --- Per-line analysis loop ---
+                for line_idx, line_name in enumerate(lines):
+                    line_hourly = hourly[hourly["line"] == line_name].copy()
+                    if len(line_hourly) == 0:
+                        continue
+
+                    # Build per-line shift summary from hourly
+                    line_ss = shift_summary.copy()  # will be rebuilt from hourly below
+                    line_overall = _build_overall(line_hourly)
+                    line_hour_avg = _build_hour_avg(line_hourly)
+
+                    # Rebuild shift summary from this line's hourly data
+                    line_hourly["_is_prod"] = (line_hourly["availability"] > 0) | (line_hourly["total_cases"] > 0)
+                    line_hourly["_prod_hours"] = line_hourly["total_hours"] * line_hourly["_is_prod"]
+                    line_hourly["_w_oee"] = line_hourly["oee_pct"] * line_hourly["_prod_hours"]
+                    ss_agg = (
+                        line_hourly.groupby(["shift_date", "shift"])
+                        .agg(
+                            total_cases=("total_cases", "sum"),
+                            total_hours=("total_hours", "sum"),
+                            _prod_hours=("_prod_hours", "sum"),
+                            _w_oee=("_w_oee", "sum"),
+                            hour_blocks=("intervals", "sum") if "intervals" in line_hourly.columns else ("total_hours", "count"),
                         )
-                    except Exception as pdf_err:
-                        st.warning(f"PDF generation failed: {pdf_err}")
-                        if not want_excel:
-                            # Fallback: offer Excel if PDF was the only choice
-                            with open(output_path, "rb") as f:
-                                excel_bytes = f.read()
+                        .reset_index()
+                    )
+                    ss_agg["oee_pct"] = (ss_agg["_w_oee"] / ss_agg["_prod_hours"].replace(0, float("nan"))).fillna(0)
+                    ss_agg.drop(columns=["_w_oee", "_prod_hours"], inplace=True)
+                    ss_agg["cases_per_hour"] = ss_agg["total_cases"] / ss_agg["total_hours"].replace(0, float("nan"))
+                    ss_agg["date"] = pd.to_datetime(ss_agg["shift_date"])
+                    ss_agg["date_str"] = ss_agg["date"].dt.strftime("%Y-%m-%d")
+                    line_ss = ss_agg
+                    line_hourly.drop(columns=["_is_prod", "_prod_hours", "_w_oee"], inplace=True, errors="ignore")
+
+                    # Match downtime to this line
+                    line_dt_list = dt_by_line.get(line_name, []) + dt_by_line.get("All", [])
+                    line_downtime = _merge_downtime_dicts(line_dt_list) if line_dt_list else None
+
+                    # Build output filename
+                    basename = os.path.splitext(oee_files[0].name)[0]
+                    if len(oee_files) > 1:
+                        basename += f"_+{len(oee_files) - 1}"
+                    suffix = "_FULL_ANALYSIS" if line_downtime else "_ANALYSIS"
+                    line_tag = f"_{line_name.replace(' ', '')}" if multi_line else ""
+                    output_name = f"{basename}{line_tag}{suffix}_{timestamp}.xlsx"
+                    output_path = os.path.join(tmp_dir, output_name)
+
+                    results = analyze(line_hourly, line_ss, line_overall, line_hour_avg, line_downtime)
+                    write_excel(results, output_path)
+
+                    # Display results under a line header
+                    if multi_line:
+                        st.subheader(line_name)
+
+                    if want_excel:
+                        with open(output_path, "rb") as f:
+                            excel_bytes = f.read()
+                        st.download_button(
+                            label=f"Download {output_name}",
+                            data=excel_bytes,
+                            file_name=output_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key=f"excel_dl_{line_idx}",
+                        )
+
+                    if want_pdf:
+                        try:
+                            from analysis_report import generate_analysis_report_bytes
+                            pdf_bytes, _report_data = generate_analysis_report_bytes([output_path])
+                            if isinstance(pdf_bytes, bytearray):
+                                pdf_bytes = bytes(pdf_bytes)
+                            pdf_name = output_name.replace(".xlsx", ".pdf")
                             st.download_button(
-                                label=f"Download {output_name} (Excel fallback)",
-                                data=excel_bytes,
-                                file_name=output_name,
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                label=f"Download {pdf_name}",
+                                data=pdf_bytes,
+                                file_name=pdf_name,
+                                mime="application/pdf",
                                 use_container_width=True,
-                                key="analyze_excel_fallback_dl",
+                                key=f"pdf_dl_{line_idx}",
                             )
+                        except Exception as pdf_err:
+                            st.warning(f"PDF generation failed: {pdf_err}")
+                            if not want_excel:
+                                with open(output_path, "rb") as f:
+                                    excel_bytes = f.read()
+                                st.download_button(
+                                    label=f"Download {output_name} (Excel fallback)",
+                                    data=excel_bytes,
+                                    file_name=output_name,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    use_container_width=True,
+                                    key=f"excel_fallback_dl_{line_idx}",
+                                )
 
-                # Quick summary metrics from Plant Summary KPIs
-                plant_data = results.get("Plant Summary")
-                if isinstance(plant_data, dict):
-                    kpis = plant_data.get("kpis", pd.DataFrame())
-                    if len(kpis) > 0:
-                        mcols = st.columns(min(4, len(kpis)))
-                        for i, (_, row) in enumerate(kpis.head(4).iterrows()):
-                            mcols[i].metric(str(row["Metric"]), str(row["Value"]))
+                    # Quick summary metrics from Plant Summary KPIs
+                    plant_data = results.get("Plant Summary")
+                    if isinstance(plant_data, dict):
+                        kpis = plant_data.get("kpis", pd.DataFrame())
+                        if len(kpis) > 0:
+                            mcols = st.columns(min(4, len(kpis)))
+                            for i, (_, row) in enumerate(kpis.head(4).iterrows()):
+                                mcols[i].metric(str(row["Metric"]), str(row["Value"]))
 
-                # Per-shift narrative in expandable sections
-                for shift_name in ["1st Shift", "2nd Shift", "3rd Shift"]:
-                    shift_data = results.get(shift_name)
-                    if isinstance(shift_data, dict):
-                        raw = shift_data.get("raw", {})
-                        with st.expander(f"{shift_name} — {raw.get('oee', 0):.1f}% OEE"):
-                            st.markdown(shift_data.get("narrative", ""))
+                    # Per-shift narrative in expandable sections
+                    for shift_name in ["1st Shift", "2nd Shift", "3rd Shift"]:
+                        shift_data = results.get(shift_name)
+                        if isinstance(shift_data, dict):
+                            raw = shift_data.get("raw", {})
+                            label = f"{line_name} — {shift_name}" if multi_line else shift_name
+                            with st.expander(f"{label} — {raw.get('oee', 0):.1f}% OEE"):
+                                st.markdown(shift_data.get("narrative", ""))
 
-                # Top 3 actions
-                focus_df = results.get("What to Focus On")
-                if focus_df is not None:
-                    for _, row in focus_df.head(3).iterrows():
-                        st.markdown(f"**#{row['Priority']}:** {row['Finding']}")
+                    # Top 3 actions
+                    focus_df = results.get("What to Focus On")
+                    if focus_df is not None:
+                        for _, row in focus_df.head(3).iterrows():
+                            st.markdown(f"**#{row['Priority']}:** {row['Finding']}")
 
-                # Display context photos
+                    st.caption(f"Sheets: {', '.join(results.keys())}")
+
+                    if multi_line:
+                        st.divider()
+
+                # Display context photos (shared across lines)
                 if context_photos:
                     with st.expander(f"Context Photos ({len(context_photos)})", expanded=True):
                         st.caption("Photos are displayed for reference. Automated photo analysis is not yet available.")
@@ -318,8 +383,6 @@ if oee_files:
                         for i, (pname, ppath) in enumerate(context_photos):
                             with photo_cols[i % 3]:
                                 st.image(ppath, caption=pname, use_container_width=True)
-
-                st.caption(f"Sheets: {', '.join(results.keys())}")
 
             except ValueError as e:
                 err_msg = str(e)

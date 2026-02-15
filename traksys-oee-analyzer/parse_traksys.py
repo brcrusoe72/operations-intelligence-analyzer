@@ -27,6 +27,22 @@ from datetime import datetime, timedelta
 SHIFT_STARTS = {"1st Shift": 7, "2nd Shift": 15, "3rd Shift": 23}
 BLOCK_SIZE = 13
 
+_LINE_RE = re.compile(r"(Line\s*\d+)", re.IGNORECASE)
+
+
+def _normalize_line(raw):
+    """Extract and normalize a line identifier like 'Line 2' from a string.
+    Returns None if no line identifier found.
+    """
+    if not raw:
+        return None
+    m = _LINE_RE.search(str(raw))
+    if not m:
+        return None
+    # Normalize: "line  2" → "Line 2"
+    parts = m.group(1).split()
+    return f"Line {parts[-1]}"
+
 
 def _safe_float(val, default=0.0):
     """Convert a cell value to float, handling None, NaN, #DIV/0!, etc."""
@@ -192,6 +208,7 @@ def parse_oee_period_detail(filepath):
         dur_str    = _cell(row + 2, 5)                # Row+2: duration
         shift_raw  = _cell(row + 5, 5)                # Row+5: shift
         product    = _cell(row + 4, 5)                # Row+4: product name
+        job_str    = _cell(row + 11, 5)               # Row+11: job (contains line id)
 
         shift = _get_shift(shift_raw)
         if shift is None:
@@ -211,6 +228,7 @@ def parse_oee_period_detail(filepath):
             "hour_bucket": bucket,
             "shift_date": sd,
             "shift": shift,
+            "line": _normalize_line(job_str),
             "product": str(product).strip() if product else "",
             "good_cases": good_cases,
             "dur_hours": dur_hours,
@@ -226,10 +244,16 @@ def parse_oee_period_detail(filepath):
         raise ValueError("No production intervals found in OEE Period Detail file")
 
     raw_df = pd.DataFrame(raw_intervals)
+    # Fill missing line values — use the most common non-null line in the file
+    if raw_df["line"].notna().any():
+        file_line = raw_df["line"].dropna().mode().iloc[0]
+        raw_df["line"] = raw_df["line"].fillna(file_line)
+    else:
+        raw_df["line"] = "All"
 
     # --- Aggregate into hourly buckets ---
     hourly_agg = (
-        raw_df.groupby(["shift_date", "shift", "hour_bucket"])
+        raw_df.groupby(["shift_date", "shift", "hour_bucket", "line"])
         .apply(_aggregate_hour, include_groups=False)
         .reset_index()
     )
@@ -383,6 +407,7 @@ def parse_event_summary(filepath):
     reasons = []
     events = []
     current_reason = None
+    detected_line = None
 
     for r in range(5, max_row):  # 0-indexed row 5 = original row 6
         col_b = _cell(r, 2)   # Line name (row 6 only)
@@ -394,8 +419,10 @@ def parse_event_summary(filepath):
         col_j = _cell(r, 10)  # Count
         col_n = _cell(r, 14)  # Total duration
 
-        # Skip Line total row
+        # Capture line identifier from Line total row, then skip it
         if col_b and "Line" in str(col_b):
+            if detected_line is None:
+                detected_line = _normalize_line(col_b)
             continue
 
         # Reason group header: Col C has value, Col D is empty
@@ -470,6 +497,7 @@ def parse_event_summary(filepath):
         "meta": {},
         "oee_summary": {},
         "pareto_raw": {},
+        "line": detected_line,
     }
 
 

@@ -251,6 +251,12 @@ if oee_files:
                                 dt_by_line.setdefault("All", []).append(photo_dt)
                                 n_issues = len(photo_dt["events_df"])
                                 st.info(f"Photo analysis: extracted {n_issues} issue(s) from {len(context_photos)} photo(s)")
+                        else:
+                            st.warning(
+                                "**Photo analysis skipped** — no OpenAI API key found. "
+                                "Set `OPENAI_API_KEY` in [Streamlit secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management) "
+                                "or as an environment variable to enable AI photo analysis."
+                            )
                     except Exception as photo_err:
                         st.warning(f"Photo analysis failed (non-blocking): {photo_err}")
 

@@ -42,7 +42,7 @@ def _image_media_type(filepath):
 
 
 def get_openai_api_key():
-    """Resolve OpenAI API key from environment or Streamlit secrets."""
+    """Resolve OpenAI API key from environment, Streamlit secrets, or Windows registry."""
     key = os.environ.get("OPENAI_API_KEY")
     if key:
         return key
@@ -53,6 +53,19 @@ def get_openai_api_key():
             return key
     except Exception:
         pass
+    # Fallback: Windows User/Machine env vars (not always in os.environ, e.g. Git Bash)
+    if os.name == "nt":
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["powershell.exe", "-Command",
+                 "[System.Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User')"],
+                capture_output=True, text=True, timeout=5)
+            key = result.stdout.strip()
+            if key:
+                return key
+        except Exception:
+            pass
     return None
 
 

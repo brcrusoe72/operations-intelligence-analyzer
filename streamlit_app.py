@@ -1,5 +1,11 @@
 """Repo-root entry point for Streamlit Cloud."""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "traksys-oee-analyzer"))
-# Re-export the real app so Streamlit Cloud picks it up
-exec(open(os.path.join(os.path.dirname(__file__), "traksys-oee-analyzer", "streamlit_app.py")).read())
+import sys, os, importlib.util
+
+# Add traksys-oee-analyzer to Python path so all modules are importable
+_pkg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traksys-oee-analyzer")
+sys.path.insert(0, _pkg)
+
+# Load and execute the real app (avoids circular import from same filename)
+_spec = importlib.util.spec_from_file_location("_app", os.path.join(_pkg, "streamlit_app.py"))
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)

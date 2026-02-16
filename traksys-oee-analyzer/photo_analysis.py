@@ -136,6 +136,48 @@ def build_photo_narrative(display_results):
     return "\n\n" + " ".join(parts)
 
 
+def _extract_json(text):
+    """Extract a JSON object from model output that may contain extra text.
+
+    Handles: bare JSON, markdown fences, preamble text before JSON, and
+    reasoning model outputs that wrap JSON in prose.
+    Raises json.JSONDecodeError if no valid JSON object can be found.
+    """
+    # 1. Try the raw text directly.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip markdown code fences (```json ... ``` or ``` ... ```).
+    fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Find the first { ... } block (greedy match for outermost braces).
+    brace_start = text.find("{")
+    if brace_start != -1:
+        # Walk forward to find matching closing brace.
+        depth = 0
+        for i in range(brace_start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[brace_start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+
+    # Nothing worked — raise so caller can handle it.
+    raise json.JSONDecodeError("No valid JSON object found", text, 0)
+
+
 def _build_prompt():
     """Build the structured extraction prompt with known equipment list."""
     equipment_list = ", ".join(sorted(EQUIPMENT_SCAN.keys()))
@@ -229,12 +271,9 @@ def analyze_photo(filepath, api_key, model_name=None):
             else:
                 raise
         raw = resp.choices[0].message.content.strip()
-        # Strip markdown fences if present
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw)
+        return _extract_json(raw)
     except json.JSONDecodeError:
-        return {"error": f"Could not parse response: {raw[:200]}",
+        return {"error": f"Could not parse response: {raw[:300]}",
                 "raw_text": raw, "issues": [], "production_notes": [],
                 "shift_notes": []}
     except Exception as e:

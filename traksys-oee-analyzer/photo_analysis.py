@@ -195,28 +195,36 @@ def analyze_photo(filepath, api_key, model_name=None):
         ],
     }]
 
-    # Modern OpenAI models use max_completion_tokens; older ones use max_tokens.
-    # Try max_completion_tokens first, fall back to max_tokens on error.
+    # Reasoning models (o1, o3, gpt-5, gpt-5-mini) don't support temperature,
+    # top_p, or max_tokens.  Only include sampling params for older models.
+    _reasoning_prefixes = ("o1", "o3", "gpt-5")
+    is_reasoning = model_name.lower().startswith(_reasoning_prefixes)
+
     create_kwargs = {
         "model": model_name,
         "messages": messages,
-        "temperature": 0.1,
         "max_completion_tokens": 1500,
     }
+    if not is_reasoning:
+        create_kwargs["temperature"] = 0.1
 
     try:
         try:
             resp = client.chat.completions.create(**create_kwargs)
         except Exception as e:
             err = str(e).lower()
-            # Retry with swapped token parameter if the API rejects the current one.
-            if "max_completion_tokens" in err or "unsupported_parameter" in err:
-                create_kwargs.pop("max_completion_tokens", None)
-                create_kwargs["max_tokens"] = 1500
-                resp = client.chat.completions.create(**create_kwargs)
-            elif "max_tokens" in err:
-                create_kwargs.pop("max_tokens", None)
-                create_kwargs["max_completion_tokens"] = 1500
+            # Drop the rejected parameter and retry once.
+            if "unsupported_parameter" in err or "unsupported_value" in err:
+                # Extract which param was rejected from the error JSON.
+                for param in ("temperature", "top_p", "max_completion_tokens",
+                              "max_tokens", "presence_penalty", "frequency_penalty"):
+                    if param in err:
+                        create_kwargs.pop(param, None)
+                # Swap token param name if max_completion_tokens was rejected.
+                if "max_completion_tokens" in err and "max_completion_tokens" not in create_kwargs:
+                    create_kwargs["max_tokens"] = 1500
+                elif "max_tokens" in err and "max_tokens" not in create_kwargs:
+                    create_kwargs["max_completion_tokens"] = 1500
                 resp = client.chat.completions.create(**create_kwargs)
             else:
                 raise

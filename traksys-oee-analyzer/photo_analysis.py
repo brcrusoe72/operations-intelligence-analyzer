@@ -226,7 +226,10 @@ def analyze_photo(filepath, api_key, model_name=None):
     media_type = _image_media_type(filepath)
     client = OpenAI(api_key=api_key)
 
-    model_name = model_name or os.environ.get("OPENAI_VISION_MODEL", "gpt-5-mini")
+    # gpt-4.1-mini is the best model for structured image extraction — fast,
+    # cheap, reliable JSON.  Reasoning models (gpt-5-mini, o3) waste tokens on
+    # hidden chain-of-thought and often return empty content.
+    model_name = model_name or os.environ.get("OPENAI_VISION_MODEL", "gpt-4.1-mini")
     messages = [{
         "role": "user",
         "content": [
@@ -237,17 +240,20 @@ def analyze_photo(filepath, api_key, model_name=None):
         ],
     }]
 
-    # Reasoning models (o1, o3, gpt-5, gpt-5-mini) don't support temperature,
-    # top_p, or max_tokens.  Only include sampling params for older models.
+    # Reasoning models (o1, o3, gpt-5) don't support temperature, top_p, or
+    # max_tokens, and need a larger token budget for hidden reasoning tokens.
     _reasoning_prefixes = ("o1", "o3", "gpt-5")
     is_reasoning = model_name.lower().startswith(_reasoning_prefixes)
 
     create_kwargs = {
         "model": model_name,
         "messages": messages,
-        "max_completion_tokens": 1500,
     }
-    if not is_reasoning:
+    if is_reasoning:
+        create_kwargs["max_completion_tokens"] = 8000
+        create_kwargs["reasoning_effort"] = "low"
+    else:
+        create_kwargs["max_completion_tokens"] = 2000
         create_kwargs["temperature"] = 0.1
 
     try:
@@ -257,20 +263,26 @@ def analyze_photo(filepath, api_key, model_name=None):
             err = str(e).lower()
             # Drop the rejected parameter and retry once.
             if "unsupported_parameter" in err or "unsupported_value" in err:
-                # Extract which param was rejected from the error JSON.
                 for param in ("temperature", "top_p", "max_completion_tokens",
-                              "max_tokens", "presence_penalty", "frequency_penalty"):
+                              "max_tokens", "presence_penalty", "frequency_penalty",
+                              "reasoning_effort"):
                     if param in err:
                         create_kwargs.pop(param, None)
-                # Swap token param name if max_completion_tokens was rejected.
+                # Swap token param name if needed.
                 if "max_completion_tokens" in err and "max_completion_tokens" not in create_kwargs:
-                    create_kwargs["max_tokens"] = 1500
+                    create_kwargs["max_tokens"] = 2000
                 elif "max_tokens" in err and "max_tokens" not in create_kwargs:
-                    create_kwargs["max_completion_tokens"] = 1500
+                    create_kwargs["max_completion_tokens"] = 2000
                 resp = client.chat.completions.create(**create_kwargs)
             else:
                 raise
-        raw = resp.choices[0].message.content.strip()
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            finish = getattr(resp.choices[0], "finish_reason", "unknown")
+            return {"error": f"Empty response from model (finish_reason={finish})",
+                    "issues": [], "production_notes": [], "shift_notes": [],
+                    "raw_text": ""}
+        raw = content.strip()
         return _extract_json(raw)
     except json.JSONDecodeError:
         return {"error": f"Could not parse response: {raw[:300]}",
@@ -391,21 +403,25 @@ def analyze_photos(photo_list, api_key, data_shifts=None):
     findings_list = []
     photo_names = []
     display_results = []
-    primary_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-5-mini")
-    fallback_model = os.environ.get("OPENAI_VISION_FALLBACK_MODEL", "gpt-5")
+    primary_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    fallback_model = os.environ.get("OPENAI_VISION_FALLBACK_MODEL", "gpt-4.1")
     enable_fallback = os.environ.get("OPENAI_VISION_ENABLE_FALLBACK", "1") != "0"
 
     for pname, ppath in photo_list:
         findings = analyze_photo(ppath, api_key, model_name=primary_model)
 
-        # If mini returns little/no signal, retry once with a stronger model.
+        # If primary returns no signal or an error, retry with fallback model.
         if enable_fallback and fallback_model and fallback_model != primary_model:
             no_signal = (
                 isinstance(findings, dict)
-                and "error" not in findings
-                and not findings.get("issues")
-                and not findings.get("shift_notes")
-                and not findings.get("production_notes")
+                and (
+                    "error" in findings
+                    or (
+                        not findings.get("issues")
+                        and not findings.get("shift_notes")
+                        and not findings.get("production_notes")
+                    )
+                )
             )
             if no_signal:
                 retry = analyze_photo(ppath, api_key, model_name=fallback_model)

@@ -170,7 +170,7 @@ Rules:
 - Do NOT fabricate issues not visible in the photo"""
 
 
-def analyze_photo(filepath, api_key):
+def analyze_photo(filepath, api_key, model_name=None):
     """Send one image to GPT vision and return parsed findings.
 
     Returns dict with keys: photo_type, confidence, issues, production_notes,
@@ -184,21 +184,45 @@ def analyze_photo(filepath, api_key):
     media_type = _image_media_type(filepath)
     client = OpenAI(api_key=api_key)
 
+    model_name = model_name or os.environ.get("OPENAI_VISION_MODEL", "gpt-5-mini")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _build_prompt()},
+            {"type": "image_url", "image_url": {
+                "url": f"data:{media_type};base64,{b64}",
+            }},
+        ],
+    }]
+
+    # GPT-5 chat completions expects max_completion_tokens, while some older
+    # models still use max_tokens.
+    create_kwargs = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.1,
+    }
+    if model_name.lower().startswith("gpt-5"):
+        create_kwargs["max_completion_tokens"] = 1500
+    else:
+        create_kwargs["max_tokens"] = 1500
+
     try:
-        resp = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _build_prompt()},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:{media_type};base64,{b64}",
-                    }},
-                ],
-            }],
-            temperature=0.1,
-            max_tokens=1500,
-        )
+        try:
+            resp = client.chat.completions.create(**create_kwargs)
+        except Exception as e:
+            err = str(e)
+            # Retry once by swapping token parameter name if model/API expects the other one.
+            if ("max_tokens" in err and "max_completion_tokens" in err) or ("unsupported_parameter" in err):
+                if "max_completion_tokens" in create_kwargs:
+                    create_kwargs.pop("max_completion_tokens", None)
+                    create_kwargs["max_tokens"] = 1500
+                else:
+                    create_kwargs.pop("max_tokens", None)
+                    create_kwargs["max_completion_tokens"] = 1500
+                resp = client.chat.completions.create(**create_kwargs)
+            else:
+                raise
         raw = resp.choices[0].message.content.strip()
         # Strip markdown fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -323,9 +347,34 @@ def analyze_photos(photo_list, api_key, data_shifts=None):
     findings_list = []
     photo_names = []
     display_results = []
+    primary_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-5-mini")
+    fallback_model = os.environ.get("OPENAI_VISION_FALLBACK_MODEL", "gpt-5")
+    enable_fallback = os.environ.get("OPENAI_VISION_ENABLE_FALLBACK", "1") != "0"
 
     for pname, ppath in photo_list:
-        findings = analyze_photo(ppath, api_key)
+        findings = analyze_photo(ppath, api_key, model_name=primary_model)
+
+        # If mini returns little/no signal, retry once with a stronger model.
+        if enable_fallback and fallback_model and fallback_model != primary_model:
+            no_signal = (
+                isinstance(findings, dict)
+                and "error" not in findings
+                and not findings.get("issues")
+                and not findings.get("shift_notes")
+                and not findings.get("production_notes")
+            )
+            if no_signal:
+                retry = analyze_photo(ppath, api_key, model_name=fallback_model)
+                # Use retry only when it improves signal or succeeds where primary errored.
+                if (
+                    isinstance(retry, dict)
+                    and (
+                        ("error" not in retry and (retry.get("issues") or retry.get("shift_notes") or retry.get("production_notes")))
+                        or ("error" in findings and "error" not in retry)
+                    )
+                ):
+                    findings = retry
+
         findings_list.append(findings)
         photo_names.append(pname)
         display_results.append((pname, findings))

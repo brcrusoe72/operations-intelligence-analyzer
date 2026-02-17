@@ -253,6 +253,10 @@ class TestDeepHistoryDeduplication:
         deep = trends.get("deep_history", {})
         hod = deep.get("hour_of_day", [])
         assert len(hod) == 2  # hours 1 and 2
+        # Ingest should short-circuit true duplicates (no new raw run row).
+        with open(oh.HISTORY_FILE, "r", encoding="utf-8") as f:
+            raw = [json.loads(l) for l in f if l.strip()]
+        assert len(raw) == 1
 
     def test_latest_run_wins(self):
         """Second save_run with different OEE should overwrite during tend_garden dedup."""
@@ -269,6 +273,13 @@ class TestDeepHistoryDeduplication:
         assert len(hod) == 1
         # The latest run (70.0) should win
         assert hod[0]["avg_oee"] == 70.0
+        # Same period with changed data should create a new revision.
+        with open(oh.HISTORY_FILE, "r", encoding="utf-8") as f:
+            raw = [json.loads(l) for l in f if l.strip()]
+        # Compaction keeps only latest row for the period.
+        assert len(raw) == 1
+        assert raw[0].get("revision") == 2
+        assert bool(raw[0].get("supersedes_run_id"))
 
     def test_invalid_run_rows_removed(self):
         """Rows with run_ids not in valid_ids should be filtered out by tend_garden."""
@@ -295,6 +306,32 @@ class TestDeepHistoryDeduplication:
         # Only the valid run's hour should remain
         assert len(hod) == 1
         assert hod[0]["avg_oee"] != 99.9
+
+    def test_duplicate_ingest_returns_duplicate_status(self):
+        hourly = _make_hourly([{"shift_hour": 1, "oee_pct": 55.0}])
+        shift_summary = _make_shift_summary([{"oee_pct": 55.0}])
+
+        first = oh.save_run(_make_results(), hourly, shift_summary, _make_overall())
+        second = oh.save_run(_make_results(), hourly, shift_summary, _make_overall())
+
+        assert second.get("ingest_status") == "duplicate_ignored"
+        assert second.get("duplicate_of_run_id") == first.get("run_id")
+        with open(oh.HISTORY_FILE, "r", encoding="utf-8") as f:
+            raw = [json.loads(l) for l in f if l.strip()]
+        assert len(raw) == 1
+
+    def test_learning_ledger_contains_revision_and_fingerprint(self):
+        hourly = _make_hourly([{"shift_hour": 1, "oee_pct": 55.0}])
+        shift_summary = _make_shift_summary([{"oee_pct": 55.0}])
+        oh.save_run(_make_results(), hourly, shift_summary, _make_overall())
+
+        ledger = oh.load_learning_ledger(limit=20)
+        assert ledger is not None
+        assert len(ledger) == 1
+        row = ledger.iloc[0]
+        assert int(row["revision"]) == 1
+        assert isinstance(row["dataset_fingerprint_short"], str)
+        assert len(row["dataset_fingerprint_short"]) > 0
 
 
 # =====================================================================

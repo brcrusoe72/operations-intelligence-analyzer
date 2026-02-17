@@ -226,6 +226,70 @@ Rules:
 - Do NOT fabricate issues not visible in the photo"""
 
 
+def _retune_create_kwargs_for_param_error(create_kwargs, error_text, is_reasoning):
+    """Retune OpenAI request kwargs for unsupported-parameter errors.
+
+    Returns True if kwargs were changed and a retry should be attempted.
+    Returns False when the error is not a recognized parameter-compatibility case.
+    """
+    err = (error_text or "")
+    err_lower = err.lower()
+    if not (
+        "unsupported_parameter" in err_lower
+        or "unsupported parameter" in err_lower
+        or "unsupported_value" in err_lower
+        or "unsupported value" in err_lower
+    ):
+        return False
+
+    # Keep the existing token budget when swapping token parameter names.
+    token_budget = (
+        create_kwargs.get("max_completion_tokens")
+        or create_kwargs.get("max_tokens")
+        or (8000 if is_reasoning else 2000)
+    )
+
+    unsupported = None
+    suggested = None
+    m_unsupported = re.search(r"Unsupported parameter:\s*'([^']+)'", err, re.IGNORECASE)
+    if m_unsupported:
+        unsupported = m_unsupported.group(1)
+    m_suggested = re.search(r"Use\s*'([^']+)'\s*instead", err, re.IGNORECASE)
+    if m_suggested:
+        suggested = m_suggested.group(1)
+
+    changed = False
+    if unsupported and unsupported in create_kwargs:
+        create_kwargs.pop(unsupported, None)
+        changed = True
+
+    # Select token parameter using explicit server guidance first.
+    if suggested in ("max_completion_tokens", "max_tokens"):
+        create_kwargs.pop("max_completion_tokens", None)
+        create_kwargs.pop("max_tokens", None)
+        create_kwargs[suggested] = token_budget
+        changed = True
+    elif unsupported in ("max_completion_tokens", "max_tokens"):
+        preferred = "max_completion_tokens" if is_reasoning else "max_completion_tokens"
+        create_kwargs.pop("max_completion_tokens", None)
+        create_kwargs.pop("max_tokens", None)
+        create_kwargs[preferred] = token_budget
+        changed = True
+
+    # Reasoning families generally reject sampling controls.
+    if is_reasoning:
+        for param in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+            if param in create_kwargs:
+                create_kwargs.pop(param, None)
+                changed = True
+    else:
+        if "reasoning_effort" in create_kwargs:
+            create_kwargs.pop("reasoning_effort", None)
+            changed = True
+
+    return changed
+
+
 def analyze_photo(filepath, api_key, model_name=None):
     """Send one image to GPT vision and return parsed findings.
 
@@ -240,10 +304,8 @@ def analyze_photo(filepath, api_key, model_name=None):
     media_type = _image_media_type(filepath)
     client = OpenAI(api_key=api_key)
 
-    # gpt-4.1-mini is the best model for structured image extraction — fast,
-    # cheap, reliable JSON.  Reasoning models (gpt-5-mini, o3) waste tokens on
-    # hidden chain-of-thought and often return empty content.
-    model_name = model_name or os.environ.get("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    # Defaults are environment-configurable. Keep primary/fallback in analyze_photos().
+    model_name = model_name or os.environ.get("OPENAI_VISION_MODEL", "gpt-5-mini")
     messages = [{
         "role": "user",
         "content": [
@@ -271,25 +333,18 @@ def analyze_photo(filepath, api_key, model_name=None):
         create_kwargs["temperature"] = 0.1
 
     try:
-        try:
-            resp = client.chat.completions.create(**create_kwargs)
-        except Exception as e:
-            err = str(e).lower()
-            # Drop the rejected parameter and retry once.
-            if "unsupported_parameter" in err or "unsupported_value" in err:
-                for param in ("temperature", "top_p", "max_completion_tokens",
-                              "max_tokens", "presence_penalty", "frequency_penalty",
-                              "reasoning_effort"):
-                    if param in err:
-                        create_kwargs.pop(param, None)
-                # Swap token param name if needed.
-                if "max_completion_tokens" in err and "max_completion_tokens" not in create_kwargs:
-                    create_kwargs["max_tokens"] = 2000
-                elif "max_tokens" in err and "max_tokens" not in create_kwargs:
-                    create_kwargs["max_completion_tokens"] = 2000
+        resp = None
+        last_exc = None
+        for _ in range(3):
+            try:
                 resp = client.chat.completions.create(**create_kwargs)
-            else:
-                raise
+                break
+            except Exception as e:
+                last_exc = e
+                if not _retune_create_kwargs_for_param_error(create_kwargs, str(e), is_reasoning):
+                    raise
+        if resp is None and last_exc is not None:
+            raise last_exc
         content = resp.choices[0].message.content
         if not content or not content.strip():
             finish = getattr(resp.choices[0], "finish_reason", "unknown")
@@ -417,8 +472,8 @@ def analyze_photos(photo_list, api_key, data_shifts=None):
     findings_list = []
     photo_names = []
     display_results = []
-    primary_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4.1-mini")
-    fallback_model = os.environ.get("OPENAI_VISION_FALLBACK_MODEL", "gpt-4.1")
+    primary_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-5-mini")
+    fallback_model = os.environ.get("OPENAI_VISION_FALLBACK_MODEL", "gpt-5.1")
     enable_fallback = os.environ.get("OPENAI_VISION_ENABLE_FALLBACK", "1") != "0"
 
     for pname, ppath in photo_list:

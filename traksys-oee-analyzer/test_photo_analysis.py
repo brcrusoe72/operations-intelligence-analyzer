@@ -8,6 +8,7 @@ import pandas as pd
 from photo_analysis import (
     _map_to_equipment_scan, findings_to_downtime_dict, _image_media_type,
     _match_shift_to_data, build_photo_narrative, _DEFAULT_DURATION_MIN,
+    _retune_create_kwargs_for_param_error, analyze_photos,
 )
 
 
@@ -167,3 +168,53 @@ class TestImageMediaType:
 
     def test_unknown_defaults_to_jpeg(self):
         assert _image_media_type("photo.bmp") == "image/jpeg"
+
+
+class TestOpenAIParamRetuning:
+    def test_retunes_max_tokens_to_max_completion_tokens(self):
+        kwargs = {"model": "gpt-5-mini", "messages": [], "max_tokens": 2000}
+        err = ("Error code: 400 - {'error': {'message': "
+               "\"Unsupported parameter: 'max_tokens' is not supported with this model. "
+               "Use 'max_completion_tokens' instead.\"}}")
+        changed = _retune_create_kwargs_for_param_error(kwargs, err, is_reasoning=True)
+        assert changed is True
+        assert "max_tokens" not in kwargs
+        assert kwargs["max_completion_tokens"] == 2000
+
+    def test_retunes_max_completion_tokens_to_max_tokens_when_server_says_so(self):
+        kwargs = {"model": "legacy-model", "messages": [], "max_completion_tokens": 1200, "temperature": 0.1}
+        err = ("Error code: 400 - {'error': {'message': "
+               "\"Unsupported parameter: 'max_completion_tokens' is not supported with this model. "
+               "Use 'max_tokens' instead.\"}}")
+        changed = _retune_create_kwargs_for_param_error(kwargs, err, is_reasoning=False)
+        assert changed is True
+        assert "max_completion_tokens" not in kwargs
+        assert kwargs["max_tokens"] == 1200
+
+    def test_non_parameter_error_does_not_rewrite(self):
+        kwargs = {"model": "gpt-5-mini", "messages": [], "max_completion_tokens": 2000}
+        changed = _retune_create_kwargs_for_param_error(kwargs, "timeout happened", is_reasoning=True)
+        assert changed is False
+        assert kwargs["max_completion_tokens"] == 2000
+
+
+class TestAnalyzePhotosDefaults:
+    def test_default_primary_and_fallback_models(self, monkeypatch):
+        calls = []
+
+        def fake_analyze_photo(filepath, api_key, model_name=None):
+            calls.append(model_name)
+            if model_name == "gpt-5-mini":
+                return {"error": "empty", "issues": [], "shift_notes": [], "production_notes": [], "raw_text": ""}
+            return {"issues": [{"equipment": "Riverwood", "description": "jam", "duration_minutes": 5, "shift": ""}],
+                    "shift_notes": [], "production_notes": [], "raw_text": ""}
+
+        monkeypatch.delenv("OPENAI_VISION_MODEL", raising=False)
+        monkeypatch.delenv("OPENAI_VISION_FALLBACK_MODEL", raising=False)
+        monkeypatch.setattr("photo_analysis.analyze_photo", fake_analyze_photo)
+
+        dt, display = analyze_photos([("p1.png", "C:\\fake\\p1.png")], "test-key")
+
+        assert calls == ["gpt-5-mini", "gpt-5.1"]
+        assert dt is not None
+        assert len(display) == 1

@@ -36,6 +36,7 @@ from analysis_report import read_analysis_workbook
 from oee_history import (
     _shewhart_limits, _nelson_rules, _trend_test,
     _classify_downtime, _analyze_shifts,
+    save_run, load_learning_ledger,
 )
 from operations_intelligence import (
     score_action_items,
@@ -154,6 +155,36 @@ def _safe_float_val(val, default=0.0):
         return default
 
 
+def _render_learning_memory_panel():
+    """Render prominent learning-memory visibility in Daily Analysis."""
+    st.subheader("Learning Memory")
+    st.caption(
+        "This app learns from each analysis run. Exact duplicate uploads are ignored automatically; "
+        "same-period changed data is tracked as a new revision."
+    )
+    try:
+        ledger = load_learning_ledger(limit=200)
+        if len(ledger) == 0:
+            st.info("No learning records yet. Run an analysis to start building memory.")
+            return
+
+        periods = int(ledger["period_key"].nunique()) if "period_key" in ledger.columns else len(ledger)
+        revisions = int(len(ledger))
+        superseded = int((ledger["supersedes_run_id"].astype(str).str.len() > 0).sum())
+        last_ingest = str(ledger.iloc[0].get("ingested_at", "")) if len(ledger) > 0 else ""
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Periods Learned", periods)
+        c2.metric("Revisions Stored", revisions)
+        c3.metric("Superseded Revisions", superseded)
+        c4.metric("Last Ingest", last_ingest[:19] if last_ingest else "n/a")
+
+        st.markdown("**Recent Learning Ledger**")
+        st.dataframe(ledger.head(12), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"Learning memory unavailable: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
@@ -214,6 +245,8 @@ with tab_daily:
         horizontal=True,
         help="Excel gives you the full multi-sheet workbook. PDF gives a 1-page summary report.",
     )
+
+    _render_learning_memory_panel()
 
     # --- Analyze ---
     if oee_files:
@@ -352,6 +385,8 @@ with tab_daily:
                     else:
                         st.success(f"Analyzing {len(dates)} day(s): {', '.join(dates)}")
 
+                    ingest_events = []
+
                     # --- Per-line analysis loop ---
                     for line_idx, line_name in enumerate(lines):
                         line_hourly = hourly[hourly["line"] == line_name].copy()
@@ -403,6 +438,28 @@ with tab_daily:
 
                         results = analyze(line_hourly, line_ss, line_overall, line_hour_avg, line_downtime,
                                           photo_findings=photo_display_results or None)
+
+                        # Persist this run to local/DB history so trend memory
+                        # can learn over time. Exact duplicate uploads for the
+                        # same period are ignored by save_run() via fingerprinting.
+                        try:
+                            saved = save_run(results, line_hourly, line_ss, line_overall, line_downtime)
+                            if isinstance(saved, dict):
+                                if saved.get("ingest_status") == "duplicate_ignored":
+                                    ingest_events.append({"line": line_name, "status": "duplicate_ignored"})
+                                    st.info(
+                                        f"History: duplicate dataset for {saved.get('date_from')} to "
+                                        f"{saved.get('date_to')} ignored (no new learning signal)."
+                                    )
+                                else:
+                                    rev = int(saved.get("revision", 1))
+                                    ingest_events.append({"line": line_name, "status": "saved", "revision": rev})
+                                    st.caption(
+                                        f"History saved: {saved.get('date_from')} to {saved.get('date_to')} "
+                                        f"(revision {rev})."
+                                    )
+                        except Exception as hist_err:
+                            st.warning(f"History save failed (non-blocking): {hist_err}")
 
                         # Inject photo findings into shift narratives — shift-specific
                         # so each shift only sees issues the AI assigned to that shift
@@ -530,6 +587,14 @@ with tab_daily:
                                 elif findings and "error" in findings:
                                     st.caption(f"Analysis error: {findings['error']}")
                                 st.markdown("---")
+
+                    # This-run ingest summary (kept concise because full ledger is shown above).
+                    if ingest_events:
+                        dup_count = sum(1 for e in ingest_events if e.get("status") == "duplicate_ignored")
+                        saved_count = sum(1 for e in ingest_events if e.get("status") == "saved")
+                        c1, c2 = st.columns(2)
+                        c1.metric("Saved This Run", saved_count)
+                        c2.metric("Duplicates Ignored", dup_count)
 
                 except ValueError as e:
                     err_msg = str(e)

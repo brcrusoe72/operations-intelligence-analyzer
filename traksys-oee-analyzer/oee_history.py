@@ -15,6 +15,7 @@ Optional: pymannkendall (pip install pymannkendall) for statistical trend test.
 
 import json
 import os
+import hashlib
 from datetime import datetime
 
 import numpy as np
@@ -39,6 +40,92 @@ def _normalize_shift(raw):
     """Map data-native shift names like '3rd (11p-7a)' to '3rd Shift'."""
     s = str(raw).strip()
     return _SHIFT_ALIASES.get(s, s)
+
+
+def _sha256_text(text):
+    """Stable SHA256 hex for text payloads."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _stable_df_fingerprint(df, cols, sort_cols=None):
+    """Create a stable fingerprint for selected DataFrame columns.
+
+    - Missing columns are filled with empty strings.
+    - Numeric columns are rounded to 4 decimals to avoid noise.
+    - Output is sorted for deterministic hashing.
+    """
+    if df is None or len(df) == 0:
+        return _sha256_text("[]")
+
+    cols = list(cols or [])
+    work = pd.DataFrame()
+    for c in cols:
+        if c in df.columns:
+            work[c] = df[c]
+        else:
+            work[c] = ""
+
+    # Normalize datetimes and numbers for deterministic hashing.
+    for c in work.columns:
+        if pd.api.types.is_datetime64_any_dtype(work[c]):
+            work[c] = pd.to_datetime(work[c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+        else:
+            as_num = pd.to_numeric(work[c], errors="coerce")
+            if as_num.notna().any():
+                work[c] = as_num.round(4).fillna(0.0)
+            else:
+                work[c] = work[c].astype(str).str.strip()
+
+    if sort_cols:
+        valid_sort = [c for c in sort_cols if c in work.columns]
+        if valid_sort:
+            work = work.sort_values(valid_sort, kind="stable")
+    work = work.reset_index(drop=True)
+
+    payload = work.to_json(orient="records", date_format="iso")
+    return _sha256_text(payload)
+
+
+def _compute_dataset_fingerprint(hourly, shift_summary, results):
+    """Compute a content fingerprint for idempotent ingest."""
+    h_cols = [
+        "date_str", "shift", "shift_hour", "line",
+        "total_cases", "total_hours", "oee_pct",
+        "availability", "performance", "quality", "product_code",
+    ]
+    h_fp = _stable_df_fingerprint(hourly, h_cols, sort_cols=["date_str", "shift", "shift_hour", "line"])
+
+    s_cols = ["date_str", "shift", "total_cases", "total_hours", "oee_pct", "cases_per_hour"]
+    s_fp = _stable_df_fingerprint(shift_summary, s_cols, sort_cols=["date_str", "shift"])
+
+    # Include top-level KPI snapshot to guard against edge parsing differences.
+    plant_data = results.get("Plant Summary", {})
+    kpis = plant_data.get("kpis", pd.DataFrame()) if isinstance(plant_data, dict) else pd.DataFrame()
+    k_fp = _stable_df_fingerprint(kpis, ["Metric", "Value"], sort_cols=["Metric"])
+
+    return _sha256_text(f"{h_fp}|{s_fp}|{k_fp}")
+
+
+def _load_records_raw():
+    """Load all raw history records from disk."""
+    if not os.path.exists(HISTORY_FILE) or os.path.getsize(HISTORY_FILE) == 0:
+        return []
+    records = []
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def _latest_record_for_period(date_from, date_to):
+    """Return latest record for a date range, or None."""
+    latest = None
+    for r in _load_records_raw():
+        if r.get("date_from") == date_from and r.get("date_to") == date_to:
+            latest = r
+    return latest
 
 
 # =========================================================================
@@ -144,10 +231,34 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
                     "pct_of_total": round(float(row["% of Total"]), 1),
                 })
 
+    date_from = date_min.strftime("%Y-%m-%d")
+    date_to = date_max.strftime("%Y-%m-%d")
+    period_key = f"{date_from}:{date_to}"
+    dataset_fingerprint = _compute_dataset_fingerprint(hourly, shift_summary, results)
+    latest_for_period = _latest_record_for_period(date_from, date_to)
+
+    # Idempotent ingest: exact same data for the same period should not create
+    # a new run or alter trend memory.
+    if latest_for_period and latest_for_period.get("dataset_fingerprint") == dataset_fingerprint:
+        deduped = dict(latest_for_period)
+        deduped["ingest_status"] = "duplicate_ignored"
+        deduped["duplicate_of_run_id"] = latest_for_period.get("run_id")
+        return deduped
+
+    revision = 1
+    supersedes_run_id = None
+    if latest_for_period is not None:
+        revision = int(latest_for_period.get("revision", 1)) + 1
+        supersedes_run_id = latest_for_period.get("run_id")
+
     record = {
         "run_id": datetime.now().isoformat(),
-        "date_from": date_min.strftime("%Y-%m-%d"),
-        "date_to": date_max.strftime("%Y-%m-%d"),
+        "date_from": date_from,
+        "date_to": date_to,
+        "period_key": period_key,
+        "dataset_fingerprint": dataset_fingerprint,
+        "revision": revision,
+        "supersedes_run_id": supersedes_run_id,
         "n_days": int(n_days),
         "avg_oee": round(avg_oee, 1),
         "avg_availability": round(avg_avail, 1),
@@ -264,12 +375,7 @@ def load_history():
     if not os.path.exists(HISTORY_FILE) or os.path.getsize(HISTORY_FILE) == 0:
         return None
 
-    records = []
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    records = _load_records_raw()
 
     if not records:
         return None
@@ -313,6 +419,39 @@ def load_history():
     downtime = pd.DataFrame(dt_rows) if dt_rows else pd.DataFrame()
 
     return {"runs": runs, "shifts": shifts, "downtime": downtime}
+
+
+def load_learning_ledger(limit=200):
+    """Return learning-ingest ledger as DataFrame (latest first).
+
+    Columns:
+      run_id, date_from, date_to, period_key, revision,
+      supersedes_run_id, dataset_fingerprint_short, ingested_at
+    """
+    records = _load_records_raw()
+    if not records:
+        return pd.DataFrame()
+
+    rows = []
+    for r in records:
+        rid = str(r.get("run_id", ""))
+        rows.append({
+            "run_id": rid,
+            "date_from": r.get("date_from", ""),
+            "date_to": r.get("date_to", ""),
+            "period_key": r.get("period_key", f"{r.get('date_from', '')}:{r.get('date_to', '')}"),
+            "revision": int(r.get("revision", 1)),
+            "supersedes_run_id": r.get("supersedes_run_id") or "",
+            "dataset_fingerprint_short": str(r.get("dataset_fingerprint", ""))[:12],
+            "ingested_at": rid,
+        })
+
+    df = pd.DataFrame(rows)
+    # run_id is ISO timestamp in this app, so lexical desc = newest first.
+    df = df.sort_values("run_id", ascending=False).reset_index(drop=True)
+    if limit and len(df) > int(limit):
+        df = df.head(int(limit)).copy()
+    return df
 
 
 def load_hourly_history():

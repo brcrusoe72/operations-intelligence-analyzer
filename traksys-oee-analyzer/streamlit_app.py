@@ -1,10 +1,10 @@
 """
-Traksys OEE Analyzer — Web Interface
-=====================================
-Upload your Traksys OEE export, get back a formatted analysis workbook.
+Operations Intelligence Analyzer - Web Interface
+================================================
+Upload production data exports and get back formatted analysis outputs.
 
 Supports both:
-  - Raw Traksys exports (OEE Period Detail + Event Summary)
+  - Structured OEE exports (TrakSYS and similar MES formats)
   - Pre-processed OEE workbooks (DayShiftHour format)
 
 Tabs:
@@ -29,10 +29,11 @@ import pandas as pd
 import numpy as np
 import altair as alt
 
-from analyze import load_oee_data, load_downtime_data, analyze, write_excel, _aggregate_oee
-from parse_traksys import parse_oee_period_detail, parse_event_summary, detect_file_type
+from analyze import analyze, write_excel, _aggregate_oee
 from shared import SHIFT_HOURS, load_standards_reference
 from analysis_report import read_analysis_workbook
+from canonical_schema import validate_and_coerce_ingest_frames
+from ingest_router import ingest_uploaded_inputs
 from oee_history import (
     _shewhart_limits, _nelson_rules, _trend_test,
     _classify_downtime, _analyze_shifts,
@@ -45,13 +46,13 @@ from operations_intelligence import (
 )
 
 st.set_page_config(
-    page_title="Traksys OEE Analyzer",
+    page_title="Operations Intelligence Analyzer",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("Traksys OEE Analyzer")
-st.markdown("Upload your OEE export. Get back a formatted analysis workbook with loss breakdowns and prioritized actions.")
+st.title("Operations Intelligence Analyzer")
+st.markdown("Upload production data. Get back Excel, PDF, or both with loss breakdowns and prioritized actions.")
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +218,7 @@ with tab_daily:
             "OEE Data (Excel) — upload one or more",
             type=["xlsx", "xls"],
             accept_multiple_files=True,
-            help="Traksys 'OEE Period Detail' export OR processed workbook with DayShiftHour sheets",
+            help="OEE export or processed workbook with DayShiftHour sheets",
         )
 
     with col2:
@@ -257,90 +258,49 @@ with tab_daily:
                 # Write uploaded files to temp directory
                 tmp_dir = tempfile.mkdtemp()
                 try:
-                    # Load all OEE files
-                    all_hourly, all_shift_summary = [], []
-                    for oee_file in oee_files:
-                        oee_path = os.path.join(tmp_dir, oee_file.name)
-                        with open(oee_path, "wb") as f:
-                            f.write(oee_file.getbuffer())
+                    ingest_bundle = ingest_uploaded_inputs(
+                        oee_files=oee_files,
+                        downtime_files=downtime_files or [],
+                        context_files=context_files or [],
+                        tmp_dir=tmp_dir,
+                    )
+                    hourly = ingest_bundle.hourly
+                    shift_summary = ingest_bundle.shift_summary
+                    dt_by_line = ingest_bundle.downtime_by_line
+                    context_photos = ingest_bundle.context_photos
+                    hourly, shift_summary, schema_warnings = validate_and_coerce_ingest_frames(hourly, shift_summary)
 
-                        file_type = detect_file_type(oee_path)
-                        if file_type == "oee_period_detail":
-                            st.info(f"Detected: {oee_file.name} — Traksys OEE Period Detail")
-                            h, ss, _ov, _ha = parse_oee_period_detail(oee_path)
-                        else:
-                            h, ss, _ov, _ha = load_oee_data(oee_path)
-                            # Ensure line column exists for old-format files
-                            if "line" not in h.columns:
-                                h["line"] = "All"
-                        all_hourly.append(h)
-                        all_shift_summary.append(ss)
-
-                    # Merge OEE data (dedup overlapping date ranges per line)
-                    hourly = pd.concat(all_hourly, ignore_index=True)
-                    if "line" not in hourly.columns:
-                        hourly["line"] = "All"
-                    hourly["line"] = hourly["line"].fillna("All")
-                    hourly = hourly.drop_duplicates(
-                        subset=["date_str", "shift", "shift_hour", "line"], keep="first")
-                    shift_summary = pd.concat(all_shift_summary, ignore_index=True)
-                    shift_summary = shift_summary.drop_duplicates(
-                        subset=["shift_date", "shift"], keep="first")
-
-                    # Load all downtime / event data files, tagged by line
-                    # dt_by_line: {line_name: [list of downtime dicts]}
-                    dt_by_line = {}
-                    if downtime_files:
-                        from parse_passdown import parse_passdown
-                        for dt_file in downtime_files:
-                            dt_path = os.path.join(tmp_dir, dt_file.name)
-                            with open(dt_path, "wb") as f:
-                                f.write(dt_file.getbuffer())
-                            try:
-                                if dt_file.name.lower().endswith(".json"):
-                                    dt_data = load_downtime_data(dt_path)
-                                    line_key = dt_data.get("line") or "All"
-                                    dt_by_line.setdefault(line_key, []).append(dt_data)
-                                else:
-                                    dt_type = detect_file_type(dt_path)
-                                    if dt_type == "event_summary":
-                                        dt_data = parse_event_summary(dt_path)
-                                        line_key = dt_data.get("line") or "All"
-                                        st.info(f"Detected: {dt_file.name} — Event Summary ({line_key})")
-                                        dt_by_line.setdefault(line_key, []).append(dt_data)
-                                    elif dt_type == "passdown":
-                                        st.info(f"Detected: {dt_file.name} — Shift Passdown")
-                                        dt_data = parse_passdown(dt_path)
-                                        line_key = dt_data.get("line") or "All"
-                                        dt_by_line.setdefault(line_key, []).append(dt_data)
-                                    else:
-                                        st.warning(f"Unrecognized downtime format: {dt_file.name}")
-                            except Exception as e:
-                                st.warning(f"Could not load {dt_file.name}: {e}")
-
-                    # Process context files (photos + additional Excel)
-                    context_photos = []
-                    if context_files:
-                        from parse_passdown import parse_passdown, detect_passdown
-                        for cf in context_files:
-                            cf_path = os.path.join(tmp_dir, cf.name)
-                            with open(cf_path, "wb") as f:
-                                f.write(cf.getbuffer())
-                            name_lower = cf.name.lower()
-                            if name_lower.endswith((".png", ".jpg", ".jpeg")):
-                                context_photos.append((cf.name, cf_path))
-                            elif name_lower.endswith((".xlsx", ".xls")):
-                                try:
-                                    if detect_passdown(cf_path):
-                                        extra = parse_passdown(cf_path)
-                                        line_key = extra.get("line") or "All"
-                                        dt_by_line.setdefault(line_key, []).append(extra)
-                                        st.info(f"Context: {cf.name} — Shift Passdown ({len(extra['events_df'])} events)")
-                                    else:
-                                        st.info(f"Context: {cf.name} — uploaded (not a recognized format)")
-                                except Exception as e:
-                                    st.warning(f"Could not parse {cf.name}: {e}")
-
+                    for info_msg in ingest_bundle.meta.info_messages:
+                        st.info(info_msg)
+                    for warn_msg in ingest_bundle.meta.warning_messages:
+                        st.warning(warn_msg)
+                    for warn_msg in schema_warnings:
+                        st.warning(f"Schema normalization: {warn_msg}")
+                    st.caption(
+                        f"Ingest mode: {ingest_bundle.meta.detected_mode} | "
+                        f"confidence: {ingest_bundle.meta.confidence:.2f}"
+                    )
+                    with st.expander("Ingest Diagnostics", expanded=False):
+                        st.write(f"Mode: `{ingest_bundle.meta.detected_mode}`")
+                        st.write(f"Confidence: `{ingest_bundle.meta.confidence:.2f}`")
+                        st.write(f"Detected sources: `{', '.join(ingest_bundle.meta.detected_sources) or 'none'}`")
+                        st.write(
+                            f"Parser chain: `{', '.join(ingest_bundle.meta.parser_chain) or 'none'}`"
+                        )
+                        st.write(
+                            f"Rows loaded: hourly `{len(hourly)}`, shift summary `{len(shift_summary)}`"
+                        )
+                        st.write(
+                            f"Downtime groups: `{len(dt_by_line)}` | Context photos: `{len(context_photos)}`"
+                        )
+                        if schema_warnings:
+                            st.write("Schema adjustments:")
+                            for warn_msg in schema_warnings:
+                                st.write(f"- {warn_msg}")
+                        if ingest_bundle.meta.warning_messages:
+                            st.write("Ingest warnings:")
+                            for warn_msg in ingest_bundle.meta.warning_messages:
+                                st.write(f"- {warn_msg}")
                     # Analyze context photos via OpenAI Vision
                     photo_display_results = []
                     if context_photos:
@@ -379,6 +339,7 @@ with tab_daily:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
                     want_excel = output_format in ("Excel (.xlsx)", "Both")
                     want_pdf = output_format in ("PDF Report (.pdf)", "Both")
+                    selected_output = "both" if want_excel and want_pdf else ("excel" if want_excel else "pdf")
 
                     if multi_line:
                         st.success(f"Analyzing {len(dates)} day(s) across {len(lines)} lines: {', '.join(lines)}")
@@ -443,7 +404,15 @@ with tab_daily:
                         # can learn over time. Exact duplicate uploads for the
                         # same period are ignored by save_run() via fingerprinting.
                         try:
-                            saved = save_run(results, line_hourly, line_ss, line_overall, line_downtime)
+                            saved = save_run(
+                                results,
+                                line_hourly,
+                                line_ss,
+                                line_overall,
+                                line_downtime,
+                                ingest_meta=ingest_bundle.meta.to_record(),
+                                output_format=selected_output,
+                            )
                             if isinstance(saved, dict):
                                 if saved.get("ingest_status") == "duplicate_ignored":
                                     ingest_events.append({"line": line_name, "status": "duplicate_ignored"})
@@ -601,7 +570,7 @@ with tab_daily:
                     if "worksheet" in err_msg.lower() or "sheet" in err_msg.lower():
                         st.error("**Sheet mismatch** — your Excel file doesn't have the expected sheet names.")
                         st.info(
-                            "The analyzer expects these sheets in your Traksys OEE export:\n\n"
+                            "The analyzer expects these sheets in your OEE export:\n\n"
                             "| Sheet | Columns |\n"
                             "|---|---|\n"
                             "| **DayShiftHour** | 14 columns — Date, Shift, StartTime, Hour, DurationHours, ProductCode, Job, GoodCases, BadCases, TotalCases, Availability, Performance, Quality, OEE |\n"
@@ -610,7 +579,7 @@ with tab_daily:
                             "| **ShiftHour_Summary** | 5 columns — Shift, Hour, AvgAvailability, AvgPerformance, AvgOEE |\n\n"
                             "**Fix options:**\n"
                             "1. Rename your sheets to match the names above\n"
-                            "2. Check that you're uploading the correct Traksys OEE export file"
+                            "2. Check that you're uploading the correct OEE export file"
                         )
                         st.code(err_msg, language=None)
                     else:
@@ -622,7 +591,7 @@ with tab_daily:
                 finally:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
-        st.info("Upload a Traksys OEE export (.xlsx) to get started.")
+        st.info("Upload an OEE export (.xlsx) to get started.")
 
 
 # ===================================================================
@@ -1117,3 +1086,4 @@ with tab_trend:
 # --- Footer ---
 st.markdown("---")
 st.caption("Built by Brian Crusoe | Numbers from the machine, not opinions")
+

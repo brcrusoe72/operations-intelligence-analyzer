@@ -1,14 +1,14 @@
-# Traksys OEE Analyzer
+# Operations Intelligence Analyzer
 
-**[Try it live](https://traksys-oee-analyzer-esh6dt3bptdjg83ubda4wb.streamlit.app/)**
+**[Try it live](https://operations-intelligence-analyzer-esh6dt3bptdjg83ubda4wb.streamlit.app/)**
 
-Production-grade OEE analysis suite for food manufacturing. Reads Traksys/MES data exports and generates multi-sheet Excel reports with shift deep dives, downtime Pareto analysis, fault classification, and prioritized action recommendations.
+Production-grade OEE analysis suite for food manufacturing. Reads MES/production data exports and generates Excel/PDF outputs with shift deep dives, downtime Pareto analysis, fault classification, and prioritized action recommendations.
 
 Built by a CI engineer who got tired of the Pareto analysis never getting done.
 
 ## What It Does
 
-Drop in your Traksys OEE export. Get back a formatted, color-coded Excel workbook with:
+Drop in your OEE export. Get back a formatted, color-coded workbook/report with:
 
 - **Executive Summary** — KPIs, date range, cases produced, top/bottom shifts
 - **Shift Deep Dives** — Hour-by-hour patterns, worst hours, consistency scores, day-of-week breakdowns
@@ -46,7 +46,7 @@ python shift_report.py oee_export.xlsx --shift "2nd"
 
 ## Streamlit App
 
-**Live at:** https://traksys-oee-analyzer-esh6dt3bptdjg83ubda4wb.streamlit.app/
+**Live at:** https://operations-intelligence-analyzer-esh6dt3bptdjg83ubda4wb.streamlit.app/
 
 Or run locally:
 
@@ -61,7 +61,7 @@ The app also includes a **Standards reference** panel (line/product targets, cas
 ## Input Data Format
 
 ### OEE Export (Excel)
-Your Traksys export needs these sheets:
+Your OEE export should include these sheets:
 - **DayShiftHour** — Hourly data with columns: Shift Date, Shift, Shift Hour, Time Block, Block Start, Block End, Cases/Hr, OEE (%), Total Cases, Total Hours, Availability, Performance, Quality, Intervals
 
 ### Downtime Knowledge Base (JSON, optional)
@@ -81,7 +81,7 @@ Your Traksys export needs these sheets:
 - **CI Engineers** who never have time to build the Pareto
 - **Plant Managers** who want numbers from the machine, not opinions
 - **Supervisors** who need shift-level accountability data
-- **Anyone** running Traksys, Vorne, or similar MES systems with OEE exports
+- **Anyone** running TrakSYS, Vorne, or similar MES systems with OEE exports
 
 ## The Philosophy
 

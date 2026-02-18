@@ -132,7 +132,7 @@ def _latest_record_for_period(date_from, date_to):
 # Layer 1: Raw append log
 # =========================================================================
 
-def save_run(results, hourly, shift_summary, overall, downtime=None):
+def save_run(results, hourly, shift_summary, overall, downtime=None, ingest_meta=None, output_format=None):
     """Extract key metrics from an analysis run, append to history.jsonl,
     then tend the garden to update plant_trends.json."""
 
@@ -271,6 +271,8 @@ def save_run(results, hourly, shift_summary, overall, downtime=None):
         "cases_lost": round(cases_lost, 0),
         "shifts": shifts,
         "top_downtime": top_downtime,
+        "ingest_meta": ingest_meta or {},
+        "output_format": output_format or "excel",
     }
 
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:

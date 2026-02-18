@@ -4,6 +4,8 @@
 
 Built by a manufacturing engineer who got tired of spreadsheet hell.
 
+### [🚀 Live Demo](https://traksys-oee-analyzer-esh6dt3bptdjg83ubda4wb.streamlit.app/)
+
 ---
 
 ## What It Does

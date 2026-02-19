@@ -4,7 +4,7 @@ Operations Intelligence Analyzer - Web Interface
 Upload production data exports and get back formatted analysis outputs.
 
 Supports both:
-  - Structured OEE exports (TrakSYS and similar MES formats)
+  - Structured OEE exports (MES and similar production-system formats)
   - Pre-processed OEE workbooks (DayShiftHour format)
 
 Tabs:

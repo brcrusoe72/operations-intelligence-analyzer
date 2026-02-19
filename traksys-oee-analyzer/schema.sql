@@ -1,4 +1,4 @@
--- Traksys OEE Analyzer — Supabase Schema
+-- Operations Intelligence Analyzer — Supabase Schema
 -- ========================================
 -- Run this in the Supabase SQL Editor (Dashboard > SQL Editor > New Query)
 --

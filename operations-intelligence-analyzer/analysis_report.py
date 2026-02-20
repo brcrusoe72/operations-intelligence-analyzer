@@ -33,6 +33,16 @@ ORANGE = (243, 156, 18)   # #F39C12 — warning / performance
 GREEN = (46, 204, 113)    # #2ECC71 — good
 BLUE = (52, 152, 219)     # #3498DB — quality
 
+_TIME_VIEWS = ("hour", "day", "week", "month", "quarter", "year")
+_TIME_VIEW_TITLES = {
+    "hour": "Hour View",
+    "day": "Day View",
+    "week": "Week View",
+    "month": "Month View",
+    "quarter": "Quarter View",
+    "year": "Year View",
+}
+
 
 def _oee_color(oee_pct):
     """Return (R,G,B) for OEE value -- red/orange/green."""
@@ -81,6 +91,116 @@ def _safe_str(val, default=""):
         pass
     s = str(val)
     return default if s.lower() == "nan" else s
+
+
+def _normalize_time_views(time_views):
+    """Normalize selected time views to a deterministic, supported list."""
+    if not time_views:
+        return ["day"]
+    normalized = []
+    for view in time_views:
+        val = str(view).strip().lower()
+        if val == "all":
+            return list(_TIME_VIEWS)
+        if val in _TIME_VIEWS and val not in normalized:
+            normalized.append(val)
+    return normalized or ["day"]
+
+
+def _build_time_view_rows(data, view):
+    """Build period rows for a selected report time view."""
+    if view == "hour":
+        shift_rows = data.get("shift_grid", [])
+        if not shift_rows:
+            return []
+        rows = []
+        for row in shift_rows:
+            date_part = str(row.get("Date", ""))[:10]
+            shift_part = _safe_str(row.get("Shift", ""))
+            label = f"{date_part} {shift_part}".strip()
+            rows.append({
+                "Period": label,
+                "OEE %": _safe_float(row.get("OEE %", 0)),
+                "Cases": _safe_float(row.get("Cases", 0)),
+                "Cases/Hr": _safe_float(row.get("CPH", 0)),
+                "Target CPH": _safe_float(row.get("Target CPH", 0)),
+                "% of Target": _safe_float(row.get("% of Target", row.get("% Tgt", 0))),
+            })
+        return rows
+
+    daily_rows = data.get("daily_trend", [])
+    if not daily_rows:
+        return []
+
+    df = pd.DataFrame(daily_rows).copy()
+    if len(df) == 0:
+        return []
+    if "Date" not in df.columns:
+        return []
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df[df["Date"].notna()].copy()
+    if len(df) == 0:
+        return []
+
+    for col in ["OEE %", "Actual Cases", "Cases", "Cases/Hr", "CPH", "Target CPH", "% of Target", "% Tgt"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if view == "day":
+        rows = []
+        for _, row in df.sort_values("Date").iterrows():
+            rows.append({
+                "Period": row["Date"].strftime("%Y-%m-%d"),
+                "OEE %": _safe_float(row.get("OEE %", 0)),
+                "Cases": _safe_float(row.get("Actual Cases", row.get("Cases", 0))),
+                "Cases/Hr": _safe_float(row.get("Cases/Hr", row.get("CPH", 0))),
+                "Target CPH": _safe_float(row.get("Target CPH", 0)),
+                "% of Target": _safe_float(row.get("% of Target", row.get("% Tgt", 0))),
+            })
+        return rows
+
+    period_map = {
+        "week": "W-SUN",
+        "month": "M",
+        "quarter": "Q",
+        "year": "Y",
+    }
+    period_key = period_map.get(view)
+    if not period_key:
+        return []
+
+    df["PeriodObj"] = df["Date"].dt.to_period(period_key)
+    agg_map = {"OEE %": "mean"}
+    for col, func in [
+        ("Actual Cases", "sum"),
+        ("Cases", "sum"),
+        ("Cases/Hr", "mean"),
+        ("CPH", "mean"),
+        ("Target CPH", "mean"),
+        ("% of Target", "mean"),
+        ("% Tgt", "mean"),
+    ]:
+        if col in df.columns:
+            agg_map[col] = func
+
+    grouped = (
+        df.groupby("PeriodObj", as_index=False)
+        .agg(agg_map)
+        .sort_values("PeriodObj")
+    )
+
+    rows = []
+    for _, row in grouped.iterrows():
+        rows.append({
+            "Period": str(row["PeriodObj"]),
+            "OEE %": _safe_float(row.get("OEE %", 0)),
+            "Cases": _safe_float(row.get("Actual Cases", row.get("Cases", 0))),
+            "Cases/Hr": _safe_float(row.get("Cases/Hr", row.get("CPH", 0))),
+            "Target CPH": _safe_float(row.get("Target CPH", 0)),
+            "% of Target": _safe_float(row.get("% of Target", row.get("% Tgt", 0))),
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -572,13 +692,13 @@ class AnalysisReport(FPDF):
     # ------------------------------------------------------------------
     # Flowing report — content breaks to new pages as needed
     # ------------------------------------------------------------------
-    def build_page1(self, data):
+    def build_page1(self, data, time_views=None):
         self.add_page()
 
         # --- Gather all data ---
         kpis = data.get("kpis", {})
         shift_rows = data.get("shift_grid", [])
-        daily_rows = data.get("daily_trend", [])
+        selected_views = _normalize_time_views(time_views)
         pareto = data.get("downtime_pareto", [])[:10]
         narratives = data.get("shift_narratives", {})
         ids_items = data.get("ids_items", [])
@@ -665,33 +785,38 @@ class AnalysisReport(FPDF):
 
         self.ln(GAP)
 
-        # === DAILY OEE TREND TABLE (full width) ===
-        self._ensure_space(HDR_H + ROW_H + 6)
-        self._section_header("Daily OEE Trend", font_size=FONT_SEC)
-        if daily_rows:
-            widths = [28, 22, 28, 24, 24, 22]
-            headers = ["Date", "OEE%", "Cases", "CPH", "Tgt CPH", "%Tgt"]
-            scale = self.epw / sum(widths)
-            widths = [w * scale for w in widths]
-            self._table_header(widths, headers, h=HDR_H, font_size=FONT_HDR)
-            for idx, row in enumerate(daily_rows):
-                if self._needs_break(ROW_H):
-                    self.add_page()
-                    self._table_header(widths, headers, h=HDR_H, font_size=FONT_HDR)
-                oee_val = _safe_float(row.get("OEE %", 0))
-                values = [
-                    str(row.get("Date", ""))[:10],
-                    f"{oee_val:.1f}",
-                    f"{_safe_float(row.get('Actual Cases', row.get('Cases', 0))):,.0f}",
-                    f"{_safe_float(row.get('Cases/Hr', row.get('CPH', 0))):,.0f}",
-                    f"{_safe_float(row.get('Target CPH', 0)):,.0f}",
-                    f"{_safe_float(row.get('% of Target', row.get('% Tgt', 0))):.1f}",
-                ]
-                self._table_row(widths, values, highlight_col=1,
-                                highlight_color=_oee_color(oee_val),
-                                fill=(idx % 2 == 1), h=ROW_H, font_size=FONT_TBL)
-
-        self.ln(GAP)
+        # === OEE TREND TABLE(S) BY SELECTED TIME VIEW(S) ===
+        for view in selected_views:
+            trend_rows = _build_time_view_rows(data, view)
+            self._ensure_space(HDR_H + ROW_H + 6)
+            self._section_header(f"{_TIME_VIEW_TITLES[view]} OEE Trend", font_size=FONT_SEC)
+            if trend_rows:
+                widths = [40, 18, 24, 20, 20, 18]
+                headers = ["Period", "OEE%", "Cases", "CPH", "Tgt CPH", "%Tgt"]
+                scale = self.epw / sum(widths)
+                widths = [w * scale for w in widths]
+                self._table_header(widths, headers, h=HDR_H, font_size=FONT_HDR)
+                for idx, row in enumerate(trend_rows):
+                    if self._needs_break(ROW_H):
+                        self.add_page()
+                        self._table_header(widths, headers, h=HDR_H, font_size=FONT_HDR)
+                    oee_val = _safe_float(row.get("OEE %", 0))
+                    values = [
+                        str(row.get("Period", ""))[:24],
+                        f"{oee_val:.1f}",
+                        f"{_safe_float(row.get('Cases', 0)):,.0f}",
+                        f"{_safe_float(row.get('Cases/Hr', 0)):,.0f}",
+                        f"{_safe_float(row.get('Target CPH', 0)):,.0f}",
+                        f"{_safe_float(row.get('% of Target', 0)):.1f}",
+                    ]
+                    self._table_row(widths, values, highlight_col=1,
+                                    highlight_color=_oee_color(oee_val),
+                                    fill=(idx % 2 == 1), h=ROW_H, font_size=FONT_TBL)
+            else:
+                self.set_font("Helvetica", "I", FONT_TBL)
+                self.cell(0, 4, "No data available for this view.")
+                self.ln()
+            self.ln(GAP)
 
         # === TOP DOWNTIME CAUSES (full width) ===
         self._ensure_space(HDR_H + ROW_H + 6)
@@ -812,12 +937,13 @@ class AnalysisReport(FPDF):
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def generate_analysis_report(excel_paths, output_path=None):
+def generate_analysis_report(excel_paths, output_path=None, time_views=None):
     """Generate a 2-page analysis PDF from up to 6 analysis Excel files.
 
     Args:
         excel_paths: list of paths to analysis workbooks (max 6)
         output_path: optional output PDF path (auto-generated if None)
+        time_views: optional list such as ["day"] or ["week", "month"]
 
     Returns:
         output_path: path to the generated PDF
@@ -848,7 +974,7 @@ def generate_analysis_report(excel_paths, output_path=None):
 
     # Build PDF
     pdf = AnalysisReport()
-    pdf.build_page1(data)
+    pdf.build_page1(data, time_views=time_views)
     pdf.build_page2(data)
 
     # Output path
@@ -861,11 +987,12 @@ def generate_analysis_report(excel_paths, output_path=None):
     return output_path
 
 
-def generate_analysis_report_bytes(excel_paths):
+def generate_analysis_report_bytes(excel_paths, time_views=None):
     """Generate analysis PDF and return as bytes (for Streamlit download).
 
     Args:
         excel_paths: list of paths to analysis workbooks (max 6)
+        time_views: optional list such as ["day"] or ["all"]
 
     Returns:
         tuple of (pdf_bytes, consolidated_data_dict)
@@ -889,7 +1016,7 @@ def generate_analysis_report_bytes(excel_paths):
     data = consolidate(workbooks)
 
     pdf = AnalysisReport()
-    pdf.build_page1(data)
+    pdf.build_page1(data, time_views=time_views)
     pdf.build_page2(data)
 
     return bytes(pdf.output()), data

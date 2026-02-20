@@ -12,6 +12,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+pytest.importorskip("fpdf")
+
 from analysis_report import (
     read_analysis_workbook,
     consolidate,
@@ -19,6 +21,8 @@ from analysis_report import (
     generate_analysis_report,
     _safe_float,
     _oee_color,
+    _normalize_time_views,
+    _build_time_view_rows,
     GREEN, ORANGE, RED,
 )
 
@@ -462,3 +466,37 @@ class TestConsolidateEdgeCases:
         assert consolidated["n_files"] == 1
         # Should still work with empty downtime
         assert len(consolidated["downtime_pareto"]) == 0
+
+
+class TestTimeViews:
+    @pytest.fixture
+    def consolidated_data(self, tmp_path):
+        wb1 = read_analysis_workbook(
+            _make_mock_analysis_workbook(str(tmp_path / "tv1.xlsx"), "2025-01-15", 42.5)
+        )
+        wb2 = read_analysis_workbook(
+            _make_mock_analysis_workbook(str(tmp_path / "tv2.xlsx"), "2025-01-16", 38.0)
+        )
+        return consolidate([wb1, wb2])
+
+    def test_normalize_all(self):
+        assert _normalize_time_views(["all"]) == ["hour", "day", "week", "month", "quarter", "year"]
+
+    def test_normalize_empty_defaults_day(self):
+        assert _normalize_time_views([]) == ["day"]
+
+    def test_build_time_rows_day(self, consolidated_data):
+        rows = _build_time_view_rows(consolidated_data, "day")
+        assert len(rows) == consolidated_data["n_days"]
+        assert "Period" in rows[0]
+
+    def test_build_time_rows_week(self, consolidated_data):
+        rows = _build_time_view_rows(consolidated_data, "week")
+        assert len(rows) >= 1
+
+    def test_generate_analysis_report_with_views(self, tmp_path):
+        p = str(tmp_path / "single_tv.xlsx")
+        _make_mock_analysis_workbook(p, "2025-01-15", 45.0)
+        output = str(tmp_path / "report_tv.pdf")
+        result = generate_analysis_report([p], output, time_views=["day", "month"])
+        assert os.path.exists(result)

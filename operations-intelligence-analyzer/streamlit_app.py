@@ -4,11 +4,7 @@ Operations Intelligence Analyzer - Web Interface
 Upload production data exports and get back formatted analysis outputs.
 
 Supports both:
-<<<<<<<< HEAD:mes-oee-analyzer/streamlit_app.py
   - Structured OEE exports (MES and similar MES formats)
-========
-  - Structured OEE exports (MACHINE and similar MES formats)
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/streamlit_app.py
   - Pre-processed OEE workbooks (DayShiftHour format)
 
 Tabs:
@@ -250,6 +246,26 @@ with tab_daily:
         horizontal=True,
         help="Excel gives you the full multi-sheet workbook. PDF gives a 1-page summary report.",
     )
+    pdf_view_label_to_value = {
+        "Hour": "hour",
+        "Day": "day",
+        "Week": "week",
+        "Month": "month",
+        "Quarter": "quarter",
+        "Year": "year",
+        "All Views": "all",
+    }
+    selected_pdf_view_labels = st.multiselect(
+        "PDF report time views",
+        options=list(pdf_view_label_to_value.keys()),
+        default=["Day"],
+        help="Choose one or more views to include in the PDF trend section.",
+    )
+    selected_pdf_views = [
+        pdf_view_label_to_value[label]
+        for label in selected_pdf_view_labels
+        if label in pdf_view_label_to_value
+    ] or ["day"]
 
     _render_learning_memory_panel()
 
@@ -470,7 +486,9 @@ with tab_daily:
                         if want_pdf:
                             try:
                                 from analysis_report import generate_analysis_report_bytes
-                                pdf_bytes, _report_data = generate_analysis_report_bytes([output_path])
+                                pdf_bytes, _report_data = generate_analysis_report_bytes(
+                                    [output_path], time_views=selected_pdf_views
+                                )
                                 if isinstance(pdf_bytes, bytearray):
                                     pdf_bytes = bytes(pdf_bytes)
                                 pdf_name = output_name.replace(".xlsx", ".pdf")

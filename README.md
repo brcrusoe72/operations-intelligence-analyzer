@@ -1,4 +1,4 @@
-# 📊 Traksys OEE Analyzer
+# 📊 Operations Intelligence Analyzer
 
 **Operations intelligence for manufacturing.** Upload raw MES exports — OEE metrics, event logs, shift passdowns, even floor photos — and get back actionable analysis: fault classification, downtime Pareto, SPC trends, shift deep dives, and prioritized recommendations.
 

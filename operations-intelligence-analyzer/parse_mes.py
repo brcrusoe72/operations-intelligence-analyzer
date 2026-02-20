@@ -1,9 +1,5 @@
 """
-<<<<<<<< HEAD:mes-oee-analyzer/parse_mes.py
 Parser for raw MES OEE exports.
-========
-Parser for raw MACHINE OEE exports.
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/parse_mes.py
 Converts 'OEE Period Detail' and 'Event Summary (Date)' exports
 into the DataFrame format expected by analyze.py.
 
@@ -68,11 +64,7 @@ def _safe_float(val, default=0.0):
 
 
 def _parse_timestamp(ts):
-<<<<<<<< HEAD:mes-oee-analyzer/parse_mes.py
     """Parse MES timestamp to Python datetime.
-========
-    """Parse MACHINE timestamp to Python datetime.
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/parse_mes.py
     Handles double-space formatting like 'Feb  6 2026  6:55AM'.
     """
     if isinstance(ts, datetime):
@@ -162,11 +154,7 @@ def _time_block(ts):
 # ---------------------------------------------------------------------------
 def parse_oee_period_detail(filepath):
     """
-<<<<<<<< HEAD:mes-oee-analyzer/parse_mes.py
     Parse a MES 'OEE Period Detail' export.
-========
-    Parse a MACHINE 'OEE Period Detail' export.
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/parse_mes.py
 
     Sheet2 has variable-length intervals (13-row blocks).
     We aggregate sub-hourly intervals into hourly buckets to match
@@ -387,11 +375,7 @@ def _aggregate_hour(group):
 # ---------------------------------------------------------------------------
 def parse_event_summary(filepath):
     """
-<<<<<<<< HEAD:mes-oee-analyzer/parse_mes.py
     Parse a MES 'Event Summary (Date)' export.
-========
-    Parse a MACHINE 'Event Summary (Date)' export.
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/parse_mes.py
 
     Hierarchical structure:
       Row 6: Line total (Col B = "Line 2 - Flex")
@@ -530,13 +514,8 @@ def detect_file_type(filepath):
     """
     Detect file format:
       'old_oee'            — processed workbook with DayShiftHour sheets
-<<<<<<<< HEAD:mes-oee-analyzer/parse_mes.py
       'oee_period_detail'  — raw MES OEE Period Detail export
       'event_summary'      — raw MES Event Summary (Date) export
-========
-      'oee_period_detail'  — raw MACHINE OEE Period Detail export
-      'event_summary'      — raw MACHINE Event Summary (Date) export
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/parse_mes.py
       'passdown'           — shift passdown spreadsheet (operator notes)
       'unknown'
     """

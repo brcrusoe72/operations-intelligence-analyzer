@@ -1,13 +1,5 @@
 """
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
 MES OEE + Downtime Analyzer
-================================
-Reads MES OEE exports AND downtime event data to generate a
-========
-MACHINE OEE + Downtime Analyzer
-================================
-Reads MACHINE OEE exports AND downtime event data to generate a
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
 complete analysis with shift-level deep dives and fault classification.
 
 Usage:
@@ -1874,11 +1866,8 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None,
                 f"{worst_name}'s top issue is {worst_top_cause[0]} — does {best_name} see the same equipment? "
                 f"If not, it's a shift-specific problem."
                 if worst_top_cause else
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
-                f"No downtime data for {worst_name} — pull MES event logs manually for that shift.")
-========
-                f"No downtime data for {worst_name} — pull MACHINE event logs manually for that shift.")
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
+                f"No downtime data for {worst_name} — pull MES event logs manually for that shift."
+            )
 
             recs.append({
                 "Priority": priority,
@@ -1980,11 +1969,7 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None,
                         "; ".join(detail_parts) + ". "
                         f"These {total_uncoded_min:.0f} minutes could be hiding the real #1 cause. "
                         f"{best_uncoded[0]} has the best coding rate ({best_uncoded[1]['pct']:.0f}% uncoded)."),
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
                     "Step 1": f"Review MES reason code tree with {worst_uncoded[0]} leads. Are codes confusing or missing common causes?",
-========
-                    "Step 1": f"Review MACHINE reason code tree with {worst_uncoded[0]} leads. Are codes confusing or missing common causes?",
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
                     "Step 2": "Simplify: 15-20 actionable codes. Merge duplicates, drop obsolete.",
                     "Step 3": f"Coach {worst_uncoded[0]} supervisors: 'If you can't code it, write a note. No blanks.'",
                     "Step 4": "Weekly audit: pull uncoded events by shift. Review with shift leads. Code retroactively.",
@@ -2006,11 +1991,7 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None,
             "Finding": "Shift comparison (no event data available for equipment-level breakdown)",
             "The Work": ". ".join(comparison_parts) + ". Upload downtime event data to see equipment-level Pareto by shift.",
             "Step 1": "The shift deep-dive tabs show OEE, cases, dead hours per shift — compare those.",
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
             "Step 2": "To get equipment-level action items, export MES downtime events and include with the OEE data.",
-========
-            "Step 2": "To get equipment-level action items, export MACHINE downtime events and include with the OEE data.",
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
             "Step 3": "Focus on the shift with the most dead hours — that's the biggest opportunity without event data.",
             "Step 4": "Talk to operators on each shift about what stops the line. Their input fills the data gap.",
             "Step 5": "Once event data is available, re-run for equipment Pareto by shift.",
@@ -2049,11 +2030,7 @@ def analyze(hourly, shift_summary, overall, hour_avg, downtime=None,
                 "Finding": f"Context photos flagged {len(photo_issues)} issue(s)",
                 "The Work": (
                     f"Photo-extracted findings: {issues_text}.{notes_text} "
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
                     f"Cross-reference with machine data above — same events or additional issues not in MES?"
-========
-                    f"Cross-reference with machine data above — same events or additional issues not in MACHINE?"
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
                 ),
                 "Step 1": "Do these match machine-data downtime causes? If yes: confirms accuracy.",
                 "Step 2": "If new issues: add to downtime tracking so they appear in future Pareto.",
@@ -2460,11 +2437,7 @@ def main():
     from parse_mes import detect_file_type, parse_oee_period_detail
     oee_type = detect_file_type(oee_file)
     if oee_type == "oee_period_detail":
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
         print("  Detected: MES OEE Period Detail export")
-========
-        print("  Detected: MACHINE OEE Period Detail export")
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
         hourly, shift_summary, overall, hour_avg = parse_oee_period_detail(oee_file)
     else:
         hourly, shift_summary, overall, hour_avg = load_oee_data(oee_file)
@@ -2479,11 +2452,7 @@ def main():
                 from parse_mes import detect_file_type, parse_event_summary
                 dt_type = detect_file_type(downtime_file)
                 if dt_type == "event_summary":
-<<<<<<<< HEAD:mes-oee-analyzer/analyze.py
                     print("  Detected: MES Event Summary export")
-========
-                    print("  Detected: MACHINE Event Summary export")
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/analyze.py
                     downtime = parse_event_summary(downtime_file)
                 elif dt_type == "passdown":
                     from parse_passdown import parse_passdown

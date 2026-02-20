@@ -1,9 +1,5 @@
 """
-<<<<<<<< HEAD:mes-oee-analyzer/db.py
 Supabase Database Layer for MES OEE Analyzer
-========
-Supabase Database Layer for MACHINE OEE Analyzer
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/db.py
 =================================================
 Equipment knowledge, downtime baselines, and persistent run history.
 

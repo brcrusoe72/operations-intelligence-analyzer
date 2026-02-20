@@ -1,9 +1,5 @@
 """
-<<<<<<<< HEAD:mes-oee-analyzer/shared.py
 Shared constants and utilities for MES OEE Analyzer
-========
-Shared constants and utilities for MACHINE OEE Analyzer
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/shared.py
 ========================================================
 Single source of truth for product normalization, fault classification,
 equipment keywords, and related helpers used across analyze.py
@@ -185,11 +181,7 @@ PALLET_AND_PIECE = {
     "Line 5": {"12 Pack": (204, 12), "24 Pack": (102, 24)},
 }
 
-<<<<<<<< HEAD:mes-oee-analyzer/shared.py
 # Map product_code from MES OEE Period Detail to pack size label
-========
-# Map product_code from MACHINE OEE Period Detail to pack size label
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/shared.py
 _PRODUCT_CODE_TO_PACK = {
     "6PK": "6 Pack", "6pk": "6 Pack", "6-TRAYED": "6-Trayed", "6-SHRINK": "6-Shrink",
     "8PK": "8 Pack", "8pk": "8 Pack",
@@ -218,11 +210,7 @@ _FAMILY_TO_PACK = {
 def get_target_cph(product_code, line="Line 2"):
     """Get target cases per hour for a product on a given line.
 
-<<<<<<<< HEAD:mes-oee-analyzer/shared.py
     Accepts raw MES product_code (e.g. '8PK') or normalized family name.
-========
-    Accepts raw MACHINE product_code (e.g. '8PK') or normalized family name.
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/shared.py
     Returns target CPH (shift target / 8) or None if unknown.
     """
     if not product_code or pd.isna(product_code):

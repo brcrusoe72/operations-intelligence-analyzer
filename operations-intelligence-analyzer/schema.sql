@@ -1,8 +1,4 @@
-<<<<<<<< HEAD:mes-oee-analyzer/schema.sql
 -- MES OEE Analyzer — Supabase Schema
-========
--- MACHINE OEE Analyzer — Supabase Schema
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/schema.sql
 -- ========================================
 -- Run this in the Supabase SQL Editor (Dashboard > SQL Editor > New Query)
 --

@@ -1,9 +1,5 @@
 """
-<<<<<<<< HEAD:mes-oee-analyzer/oee_history.py
 History + SPC Engine for MES OEE Analyzer
-========
-History + SPC Engine for MACHINE OEE Analyzer
->>>>>>>> 7037fd9 (Rebrand to operations-intelligence and restore parser/test compatibility):operations-intelligence-analyzer/oee_history.py
 ==============================================
 Two-layer architecture:
   1. history.jsonl   — append-only raw log (receipt of every run)

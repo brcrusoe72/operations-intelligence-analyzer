@@ -13,7 +13,7 @@ from analyze import (
     _aggregate_oee, _smart_rename, _weighted_mean, EXPECTED_SHEETS,
     _compute_utilization, _build_dead_hour_narrative,
     _correlate_dead_hours_with_events,
-    _compute_shift_data, _build_shift_narrative,
+    _compute_shift_data, _build_shift_narrative, load_oee_data,
 )
 from datetime import datetime, timedelta
 
@@ -212,6 +212,56 @@ class TestSmartRename:
         assert "shift_date" in result.columns
         assert "shift_hour" in result.columns
         assert "oee_pct" in result.columns
+
+
+class TestSingleSheetFallback:
+    def test_load_oee_data_single_data_sheet(self, tmp_path):
+        path = tmp_path / "single_data.xlsx"
+        df = pd.DataFrame(
+            [
+                {
+                    "Date": "2026-02-18",
+                    "Shift": "1st Shift",
+                    "StartTime": "7:00am-8:00am",
+                    "Hour": 1,
+                    "DurationHours": 1.0,
+                    "ProductCode": "8PK",
+                    "Job": "Line 2",
+                    "GoodCases": 1000,
+                    "BadCases": 20,
+                    "TotalCases": 1020,
+                    "Availability": 0.85,
+                    "Performance": 0.9,
+                    "Quality": 0.98,
+                    "OEE": 75.0,
+                },
+                {
+                    "Date": "2026-02-18",
+                    "Shift": "1st Shift",
+                    "StartTime": "8:00am-9:00am",
+                    "Hour": 2,
+                    "DurationHours": 1.0,
+                    "ProductCode": "8PK",
+                    "Job": "Line 2",
+                    "GoodCases": 980,
+                    "BadCases": 10,
+                    "TotalCases": 990,
+                    "Availability": 0.82,
+                    "Performance": 0.88,
+                    "Quality": 0.99,
+                    "OEE": 71.0,
+                },
+            ]
+        )
+        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="Data", index=False)
+
+        hourly, shift_summary, overall, hour_avg = load_oee_data(str(path))
+        assert len(hourly) == 2
+        assert len(shift_summary) == 1
+        assert len(overall) == 1
+        assert len(hour_avg) == 2
+        assert "date_str" in hourly.columns
 
 
 # =====================================================================

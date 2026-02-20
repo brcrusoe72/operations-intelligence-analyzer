@@ -426,12 +426,126 @@ def _resolve_sheets(filepath):
     return matched
 
 
+def _build_summary_frames_from_hourly(hourly):
+    """Build shift/day summaries from a normalized hourly dataframe."""
+    work = hourly.copy()
+    work["_is_prod"] = (work["availability"] > 0) | (work["total_cases"] > 0)
+    work["_prod_hours"] = work["total_hours"] * work["_is_prod"]
+    work["_w_oee"] = work["oee_pct"] * work["_prod_hours"]
+
+    shift_summary = (
+        work.groupby(["shift_date", "shift"], as_index=False)
+        .agg(
+            total_hours=("total_hours", "sum"),
+            good_cases=("good_cases", "sum"),
+            bad_cases=("bad_cases", "sum"),
+            total_cases=("total_cases", "sum"),
+            _prod_hours=("_prod_hours", "sum"),
+            _w_oee=("_w_oee", "sum"),
+            hour_blocks=("shift_hour", "count"),
+        )
+    )
+    shift_summary["oee_pct"] = (
+        shift_summary["_w_oee"] / shift_summary["_prod_hours"].replace(0, np.nan)
+    ).fillna(0)
+    shift_summary["cases_per_hour"] = (
+        shift_summary["total_cases"] / shift_summary["total_hours"].replace(0, np.nan)
+    ).fillna(0)
+    shift_summary.drop(columns=["_w_oee", "_prod_hours"], inplace=True)
+    shift_summary["date"] = pd.to_datetime(shift_summary["shift_date"], errors="coerce")
+    shift_summary["date_str"] = shift_summary["date"].dt.strftime("%Y-%m-%d")
+
+    overall = (
+        work.groupby("shift", as_index=False)
+        .agg(
+            total_hours=("total_hours", "sum"),
+            good_cases=("good_cases", "sum"),
+            bad_cases=("bad_cases", "sum"),
+            total_cases=("total_cases", "sum"),
+            _prod_hours=("_prod_hours", "sum"),
+            _w_oee=("_w_oee", "sum"),
+            n_intervals=("shift_hour", "count"),
+        )
+    )
+    overall["oee_pct"] = (overall["_w_oee"] / overall["_prod_hours"].replace(0, np.nan)).fillna(0)
+    overall["cases_per_hour"] = (overall["total_cases"] / overall["total_hours"].replace(0, np.nan)).fillna(0)
+    overall.drop(columns=["_w_oee", "_prod_hours"], inplace=True)
+
+    hour_avg = (
+        work.groupby(["shift", "shift_hour"], as_index=False)
+        .agg(
+            time_block=("time_block", "first"),
+            total_hours=("total_hours", "sum"),
+            _prod_hours=("_prod_hours", "sum"),
+            _w_oee=("_w_oee", "sum"),
+            total_cases=("total_cases", "sum"),
+            availability=("availability", "mean"),
+            performance=("performance", "mean"),
+        )
+    )
+    hour_avg["oee_pct"] = (hour_avg["_w_oee"] / hour_avg["_prod_hours"].replace(0, np.nan)).fillna(0)
+    hour_avg["cases_per_hour"] = (hour_avg["total_cases"] / hour_avg["total_hours"].replace(0, np.nan)).fillna(0)
+    hour_avg.drop(columns=["_w_oee", "_prod_hours", "total_cases"], inplace=True)
+    return shift_summary, overall, hour_avg
+
+
+def _load_single_sheet_oee(filepath):
+    """Fallback parser for one-sheet OEE exports (often named 'Data')."""
+    xls = pd.ExcelFile(filepath)
+    if len(xls.sheet_names) != 1:
+        raise ValueError("single-sheet fallback only applies to one-sheet OEE files")
+    sheet_name = xls.sheet_names[0]
+    xls.close()
+
+    hourly = pd.read_excel(filepath, sheet_name=sheet_name)
+    hourly = _smart_rename(hourly, EXPECTED_SHEETS["DayShiftHour"]["columns"])
+    hourly = _coerce_numerics(hourly)
+    hourly = _derive_columns(hourly)
+
+    # Fill required columns if missing from source export.
+    if "good_cases" not in hourly.columns:
+        hourly["good_cases"] = hourly.get("total_cases", 0)
+    if "bad_cases" not in hourly.columns:
+        hourly["bad_cases"] = 0.0
+    if "availability" not in hourly.columns:
+        hourly["availability"] = 0.0
+    if "performance" not in hourly.columns:
+        hourly["performance"] = 0.0
+    if "quality" not in hourly.columns:
+        hourly["quality"] = 1.0
+    if "line" not in hourly.columns:
+        hourly["line"] = "All"
+
+    needed = {"shift_date", "shift", "shift_hour", "total_hours", "total_cases", "oee_pct"}
+    missing = sorted(c for c in needed if c not in hourly.columns)
+    if missing:
+        raise ValueError(
+            f"One-sheet OEE file is missing required columns: {', '.join(missing)}"
+        )
+
+    hourly["date"] = pd.to_datetime(hourly["shift_date"], errors="coerce")
+    mask = hourly["date"].isna()
+    if mask.any():
+        hourly.loc[mask, "date"] = hourly.loc[mask, "shift_date"].apply(excel_date_to_datetime)
+    hourly["date_str"] = hourly["date"].dt.strftime("%Y-%m-%d")
+    hourly["day_of_week"] = hourly["date"].dt.day_name()
+
+    shift_summary, overall, hour_avg = _build_summary_frames_from_hourly(hourly)
+    return hourly, shift_summary, overall, hour_avg
+
+
 # ---------------------------------------------------------------------------
 # Load OEE Data
 # ---------------------------------------------------------------------------
 def load_oee_data(filepath):
     print(f"Reading OEE data: {filepath}")
-    sheet_map = _resolve_sheets(filepath)
+    try:
+        sheet_map = _resolve_sheets(filepath)
+    except ValueError as e:
+        # Fallback for one-sheet exports from MES systems (commonly named "Data").
+        fallback = _load_single_sheet_oee(filepath)
+        print("  Matched sheets: single-sheet fallback")
+        return fallback
     print(f"  Matched sheets: {sheet_map}")
 
     # --- DayShiftHour (hourly detail) ---

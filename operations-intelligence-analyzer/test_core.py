@@ -297,6 +297,36 @@ class TestSingleSheetFallback:
         assert len(overall) == 1
         assert len(hour_avg) == 1
 
+    def test_load_oee_data_single_sheet_loose_headers(self, tmp_path):
+        path = tmp_path / "single_data_loose.xlsx"
+        df = pd.DataFrame(
+            [
+                {
+                    "Production Date": "2026-02-18",
+                    "Shift Name": "First",
+                    "Start Timestamp": "2026-02-18 07:00:00",
+                    "HR": 7,
+                    "Duration": 1.0,
+                    "Good": 1000,
+                    "Bad": 20,
+                    "Total": 1020,
+                    "OEE %": 75.0,
+                    "Avail %": 85.0,
+                    "Perf %": 90.0,
+                    "Qual %": 98.0,
+                }
+            ]
+        )
+        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="Data", index=False)
+
+        hourly, shift_summary, overall, hour_avg = load_oee_data(str(path))
+        assert len(hourly) == 1
+        assert hourly.iloc[0]["shift"] == "1st Shift"
+        assert len(shift_summary) == 1
+        assert len(overall) == 1
+        assert len(hour_avg) == 1
+
 
 # =====================================================================
 # _weighted_mean — helper for production-weighted averages

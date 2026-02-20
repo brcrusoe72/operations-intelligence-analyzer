@@ -489,6 +489,75 @@ def _build_summary_frames_from_hourly(hourly):
     return shift_summary, overall, hour_avg
 
 
+def _canonical_shift_label(val):
+    """Normalize common shift labels to canonical names."""
+    s = str(val).strip().lower()
+    if not s or s == "nan":
+        return None
+    if "1" in s or "first" in s:
+        return "1st Shift"
+    if "2" in s or "second" in s:
+        return "2nd Shift"
+    if "3" in s or "third" in s:
+        return "3rd Shift"
+    return str(val).strip()
+
+
+def _shift_from_hour(hour_val):
+    """Infer shift from a 24h clock hour."""
+    try:
+        h = int(float(hour_val)) % 24
+    except (TypeError, ValueError):
+        return None
+    if 7 <= h < 15:
+        return "1st Shift"
+    if 15 <= h < 23:
+        return "2nd Shift"
+    return "3rd Shift"
+
+
+def _loose_single_sheet_rename(df):
+    """Looser header mapping for one-sheet files with non-standard headers."""
+    rename = {}
+    for col in df.columns:
+        norm = _normalize_col(col)
+        if norm in _HEADER_TO_INTERNAL:
+            rename[col] = _HEADER_TO_INTERNAL[norm]
+            continue
+        if "shift" in norm and "hour" not in norm:
+            rename[col] = "shift"
+        elif norm in {"date", "productiondate", "workdate", "day"}:
+            rename[col] = "shift_date"
+        elif "starttime" in norm or "timestamp" in norm or norm == "start":
+            rename[col] = "time_block"
+        elif norm in {"hour", "hr", "hour24"}:
+            rename[col] = "shift_hour"
+        elif "duration" in norm or norm in {"hours", "hrs"}:
+            rename[col] = "total_hours"
+        elif norm in {"good", "goodcount"}:
+            rename[col] = "good_cases"
+        elif norm in {"bad", "rejects", "scrap"}:
+            rename[col] = "bad_cases"
+        elif norm in {"total", "totalcount"}:
+            rename[col] = "total_cases"
+        elif "oee" in norm:
+            rename[col] = "oee_pct"
+        elif "avail" in norm:
+            rename[col] = "availability"
+        elif "perf" in norm:
+            rename[col] = "performance"
+        elif "qual" in norm:
+            rename[col] = "quality"
+        elif "product" in norm:
+            rename[col] = "product_code"
+        elif "job" in norm or "line" in norm:
+            rename[col] = "job"
+
+    if rename:
+        return df.rename(columns=rename)
+    return df
+
+
 def _load_single_sheet_oee(filepath):
     """Fallback parser for one-sheet OEE exports (often named 'Data')."""
     xls = pd.ExcelFile(filepath)
@@ -518,7 +587,12 @@ def _load_single_sheet_oee(filepath):
     else:
         hourly = pd.read_excel(filepath, sheet_name=sheet_name)
 
-    hourly = _smart_rename(hourly, EXPECTED_SHEETS["DayShiftHour"]["columns"])
+    try:
+        hourly = _smart_rename(hourly, EXPECTED_SHEETS["DayShiftHour"]["columns"])
+    except ValueError:
+        pass
+    # Always run looser mapping too so partially-matched files still normalize.
+    hourly = _loose_single_sheet_rename(hourly)
     hourly = _coerce_numerics(hourly)
     hourly = _derive_columns(hourly)
 
@@ -536,7 +610,26 @@ def _load_single_sheet_oee(filepath):
     if "line" not in hourly.columns:
         hourly["line"] = "All"
 
+    if "shift" in hourly.columns:
+        hourly["shift"] = hourly["shift"].map(_canonical_shift_label)
+
     needed = {"shift_date", "shift", "shift_hour", "total_hours", "total_cases", "oee_pct"}
+    if "shift_hour" not in hourly.columns and "time_block" in hourly.columns:
+        parsed_tb = pd.to_datetime(hourly["time_block"], errors="coerce")
+        if parsed_tb.notna().any():
+            hourly.loc[parsed_tb.notna(), "shift_hour"] = parsed_tb[parsed_tb.notna()].dt.hour + 1
+            if "shift_date" not in hourly.columns:
+                hourly["shift_date"] = parsed_tb.dt.date.astype(str)
+
+    if "shift" not in hourly.columns and "shift_hour" in hourly.columns:
+        hourly["shift"] = hourly["shift_hour"].apply(_shift_from_hour)
+
+    if "total_hours" not in hourly.columns:
+        hourly["total_hours"] = 1.0
+
+    if "total_cases" not in hourly.columns and "good_cases" in hourly.columns:
+        hourly["total_cases"] = hourly["good_cases"] + hourly.get("bad_cases", 0)
+
     missing = sorted(c for c in needed if c not in hourly.columns)
     if missing:
         raise ValueError(
